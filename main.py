@@ -122,18 +122,49 @@ class TaskRequest(BaseModel):
     obo_ttl: int = 120
 
 
+def _bearer(value: Optional[str]) -> str:
+    v = value or ""
+    return v[7:].strip() if v.lower().startswith("bearer ") else ""
+
+
 @app.post("/task")
 @tracing.agent_entry("concierge_task", agent=AGENT_ID, runtime=RUNTIME)
 async def task(req: TaskRequest,
-               authorization: Optional[str] = Header(default=None)):
-    """User -> this agent -> payments agent -> gateway -> MCP."""
+               authorization: Optional[str] = Header(default=None),
+               x_user_authorization: Optional[str] = Header(default=None)):
+    """User -> this agent -> payments agent -> gateway -> MCP.
+
+    The user's token can arrive two ways, and both are verified here.
+
+      Authorization          when the Agent Manager gateway has an identity
+                             provider registered for the token's issuer, it
+                             validates the token and -- with forwardToken on --
+                             passes it straight through.
+      X-User-Authorization   when it does not. The gateway only trusts issuers
+                             in its key manager list; on this build a custom
+                             provider registered through the API is stored and
+                             listed for the environment but never reaches that
+                             list, so a token from the platform identity
+                             provider is refused at the edge. The caller then
+                             authenticates to the gateway with its own client
+                             credential and carries the user's token here,
+                             where this agent verifies its signature against
+                             the issuer's key set before acting on it.
+
+    Either way nothing is taken on trust: whichever header carries it, the
+    token is cryptographically verified before the agent does anything on the
+    user's behalf.
+    """
     trace_id = req.trace_id or new_trace()
     steps: List[Dict[str, Any]] = []
     gw = mcpgw.gateway_url()
 
     # ---- hop 1: the user ------------------------------------------------
-    bearer = (authorization or "")[7:] if (authorization or "").lower().startswith("bearer ") else ""
-    tracing.set_attributes(trace_id=trace_id, agent=AGENT_ID, runtime=RUNTIME)
+    bearer = _bearer(x_user_authorization) or _bearer(authorization)
+    via = ("X-User-Authorization" if _bearer(x_user_authorization)
+           else "Authorization" if _bearer(authorization) else "")
+    tracing.set_attributes(trace_id=trace_id, agent=AGENT_ID, runtime=RUNTIME,
+                           user_token_via=via or "none")
     if not bearer:
         if REQUIRE_USER_TOKEN:
             hop(steps, "user -> agent", "USER", "DENY",
@@ -149,7 +180,8 @@ async def task(req: TaskRequest,
                 userauth.verify(bearer, issuer=os.getenv("USER_TOKEN_ISSUER") or None)
                 user = userauth.identity(bearer)
                 hop(steps, "user -> agent", "USER", "ALLOW",
-                    f"user token verified against {user['issuer']}/oauth2/jwks",
+                    f"user token verified against {user['issuer']} "
+                    f"(presented in {via})",
                     actor=user["username"], token=userauth.identity(bearer))
                 tracing.record_decision("ALLOW", "agent",
                                         "user token signature verified",
