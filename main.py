@@ -46,8 +46,15 @@ AGENT_ID = os.getenv("AGENT_NAME", "demo2-concierge-agent")
 RUNTIME = os.getenv("AGENT_RUNTIME", "runtime-a")
 PAYMENTS_AGENT = os.getenv("PAYMENTS_AGENT_NAME", "demo2-payments-agent")
 PAYMENTS_URL = os.getenv("PAYMENTS_AGENT_URL", "")
-PAYMENTS_INTERNAL = os.getenv("PAYMENTS_AGENT_INTERNAL_URL",
-                              "http://demo2-payments-agent:8000")
+# Several plausible in-cluster addresses, tried in order. The service name and
+# port are not discoverable from inside the agent, and the published endpoint
+# sits behind an API key this agent has no way to obtain -- so the honest thing
+# is to try the likely ones and record the failure if none of them answer.
+PAYMENTS_CANDIDATES = [u.strip() for u in os.getenv(
+    "PAYMENTS_AGENT_URLS",
+    "http://demo2-payments-agent:8000,"
+    "http://demo2-payments-agent,"
+    "http://demo2-payments-agent-service:8000").split(",") if u.strip()]
 LOW_TOOL = os.getenv("LOW_TOOL", "get_order")
 CONFIDENTIAL_SCOPE = os.getenv("CONFIDENTIAL_SCOPE", "")
 REQUIRE_USER_TOKEN = os.getenv("REQUIRE_USER_TOKEN", "true").lower() != "false"
@@ -85,7 +92,7 @@ async def payments_base(client: httpx.AsyncClient) -> str:
     global _payments_base
     if _payments_base is not None:
         return _payments_base
-    for candidate in (PAYMENTS_INTERNAL, PAYMENTS_URL):
+    for candidate in PAYMENTS_CANDIDATES + ([PAYMENTS_URL] if PAYMENTS_URL else []):
         if not candidate:
             continue
         try:
@@ -95,7 +102,8 @@ async def payments_base(client: httpx.AsyncClient) -> str:
                 return _payments_base
         except Exception:
             continue
-    _payments_base = (PAYMENTS_URL or PAYMENTS_INTERNAL).rstrip("/")
+    _payments_base = (PAYMENTS_CANDIDATES[0] if PAYMENTS_CANDIDATES
+                      else PAYMENTS_URL).rstrip("/")
     return _payments_base
 
 
@@ -360,7 +368,8 @@ async def whoami():
         "mcp_gateway": mcpgw.endpoints(),
         "calls_mcp_directly": False,
         "payments_agent": {"name": PAYMENTS_AGENT,
-                           "internal": PAYMENTS_INTERNAL, "published": PAYMENTS_URL},
+                           "candidates": PAYMENTS_CANDIDATES,
+                           "published": PAYMENTS_URL},
     }
     if agentid.configured() and gw:
         try:
