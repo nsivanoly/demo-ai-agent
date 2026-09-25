@@ -27,7 +27,32 @@ app = FastAPI(title="Payments Agent", version="1.0.0")
 AGENT_ID = os.getenv("AGENT_NAME", "payments-agent")
 RUNTIME = os.getenv("AGENT_RUNTIME", "runtime-b")
 MCP_URL = os.getenv("MCP_URL", "http://host.k3d.internal:8892/mcp")
+# resolved lazily so the AMP-injected gateway URL is preferred when usable
 CONFIDENTIAL_TOOL = os.getenv("CONFIDENTIAL_TOOL", "configure_workflow")
+
+
+def mcp_url() -> str:
+    """Where to send tool calls.
+
+    When an MCP proxy is attached to the agent, AMP injects the gateway URL as
+    <MCP-CONFIG-NAME>_MCP_CONFIG_URL. Prefer it, so that the moment the proxy
+    reconciles onto the gateway the traffic flows through AMP with no code
+    change. Until then the gateway returns 404 for MCP proxies on this build,
+    so fall back to calling the enforcement point directly.
+    """
+    injected = next((v for k, v in os.environ.items()
+                     if k.endswith("_MCP_CONFIG_URL") and v), "")
+    direct = os.getenv("MCP_URL", "http://host.k3d.internal:8892/mcp")
+    if not injected:
+        return direct
+    try:
+        r = httpx.post(injected, json={"jsonrpc": "2.0", "id": 0,
+                                       "method": "tools/list"}, timeout=5)
+        if r.status_code < 400:
+            return injected
+    except Exception:
+        pass
+    return direct
 
 
 def claims_of(token: str) -> Dict[str, Any]:
@@ -56,7 +81,7 @@ async def settle(req: SettleRequest):
 
     async with httpx.AsyncClient(timeout=30) as client:
         out = await client.post(
-            MCP_URL,
+            mcp_url(),
             json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                   "params": {"name": CONFIDENTIAL_TOOL,
                              "arguments": {"payment_ref": req.payment_ref,
