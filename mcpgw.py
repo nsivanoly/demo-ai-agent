@@ -1,10 +1,21 @@
 """
 The only way this demo reaches an MCP tool: through the Agent Manager gateway.
 
-AMP injects the gateway URL for the agent's MCP proxy binding as
-<CONFIG>_MCP_CONFIG_URL. That URL is both the endpoint and the OAuth 2.0 target
-resource the AgentID token is bound to, so it has to be settled before the
-token is minted -- not just before the call.
+Two URLs, and they are deliberately not the same one.
+
+  WHERE TO CALL       the gateway's in-cluster Kubernetes service. The vhost
+                      Agent Manager publishes is a *.localhost name that
+                      resolves on the operator's machine and nowhere inside the
+                      cluster, so an agent that calls it gets DNS failure.
+  WHAT TO BIND TO     the registered resource, which IS that external URL. RFC
+                      8707 target-resource indication only accepts a resource
+                      the identity provider has registered, so binding the
+                      token to the in-cluster address fails with
+                      `invalid_target`.
+
+The token therefore says "meant for the gateway at its published address" while
+travelling to the same gateway by its internal one. Both are set by the demo
+setup; this module picks whichever address actually answers.
 
 There is no direct-to-server fallback, deliberately. The gateway is the policy
 enforcement point; a fallback that bypasses it would make the demo prove
@@ -27,17 +38,55 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 _ctx_tools: Optional[set] = None
+_chosen_url: Optional[str] = None
 
 
 class GatewayError(RuntimeError):
     pass
 
 
-def gateway_url() -> str:
-    """The MCP gateway URL AMP injected for this agent's proxy binding."""
+def _candidates() -> List[str]:
     injected = next((v for k, v in os.environ.items()
                      if k.endswith("_MCP_CONFIG_URL") and v), "")
-    return injected or os.getenv("MCP_GATEWAY_URL", "")
+    seen, out = set(), []
+    for u in (os.getenv("MCP_GATEWAY_URL", ""), injected,
+              os.getenv("MCP_GATEWAY_URL_EXTERNAL", ""), os.getenv("MCP_RESOURCE", "")):
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def gateway_resource() -> str:
+    """The OAuth 2.0 target resource the AgentID token must be bound to."""
+    return (os.getenv("MCP_RESOURCE")
+            or os.getenv("MCP_GATEWAY_URL_EXTERNAL")
+            or next((v for k, v in os.environ.items()
+                     if k.endswith("_MCP_CONFIG_URL") and v), "")
+            or os.getenv("MCP_GATEWAY_URL", ""))
+
+
+def gateway_url() -> str:
+    """The gateway address that answers from wherever this is running.
+
+    Any HTTP response counts as reachable, including 401 -- a gateway refusing
+    an unauthenticated probe is a gateway that is there. Only DNS and connection
+    failures move on to the next candidate. Probed once.
+    """
+    global _chosen_url
+    if _chosen_url is not None:
+        return _chosen_url
+    cands = _candidates()
+    for url in cands:
+        try:
+            httpx.post(url, json={"jsonrpc": "2.0", "id": 0, "method": "tools/list"},
+                       timeout=8)
+            _chosen_url = url
+            return url
+        except Exception:
+            continue
+    _chosen_url = cands[0] if cands else ""
+    return _chosen_url
 
 
 def _rpc(url: str, token: str, method: str, params: Any,
@@ -58,6 +107,12 @@ def _rpc(url: str, token: str, method: str, params: Any,
         payload = {"error": {"code": r.status_code, "message": r.text[:200]}}
     payload["_http_status"] = r.status_code
     return payload
+
+
+def endpoints() -> Dict[str, str]:
+    """What this agent is using, for /whoami."""
+    return {"calls": gateway_url(), "token_bound_to": gateway_resource(),
+            "candidates": _candidates()}
 
 
 def supports_ctx(url: str, token: str) -> bool:

@@ -100,7 +100,7 @@ async def settle(req: SettleRequest,
     # ---- this agent's OWN AMP identity ----------------------------------
     gw = mcpgw.gateway_url()
     try:
-        token = agentid.get_token(resource=gw)
+        token = agentid.get_token(resource=mcpgw.gateway_resource())
     except agentid.AgentIDError as exc:
         hop(steps, "agent -> AMP IdP", "AMP", "DENY", str(exc))
         return {"status": "failed", "at": "agentid", "trace_id": trace_id,
@@ -139,13 +139,14 @@ async def whoami():
         "agent": AGENT_ID, "runtime": RUNTIME,
         "agentid_configured": agentid.configured(),
         "scopes_requested": agentid.granted_scopes(),
-        "mcp_gateway_url": gw or None,
+        "mcp_gateway": mcpgw.endpoints(),
         "calls_mcp_directly": False,
         "trusted_delegators": TRUSTED_DELEGATORS,
     }
     if agentid.configured() and gw:
         try:
-            info["token_claims"] = token_view(agentid.get_token(resource=gw))
+            info["token_claims"] = token_view(
+                agentid.get_token(resource=mcpgw.gateway_resource()))
         except Exception as exc:
             info["token_error"] = str(exc)
     return info
