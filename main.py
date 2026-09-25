@@ -29,29 +29,54 @@ RUNTIME = os.getenv("AGENT_RUNTIME", "runtime-b")
 MCP_URL = os.getenv("MCP_URL", "http://host.k3d.internal:8892/mcp")
 # resolved lazily so the AMP-injected gateway URL is preferred when usable
 CONFIDENTIAL_TOOL = os.getenv("CONFIDENTIAL_TOOL", "configure_workflow")
+_GW_OK = None
+
+
+def _gateway_url() -> str:
+    """The MCP gateway URL AMP injects for this agent's proxy binding."""
+    return next((v for k, v in os.environ.items()
+                 if k.endswith("_MCP_CONFIG_URL") and v), "")
+
+
+def _gateway_usable(url: str) -> bool:
+    """Is the AMP gateway actually serving the MCP proxy?
+
+    On builds where the proxy has not reconciled onto the gateway there is no
+    Mcp artifact, so the route 404s -- and the injected hostname does not even
+    resolve from inside the cluster. Probe once and cache.
+    """
+    global _GW_OK
+    if _GW_OK is not None:
+        return _GW_OK
+    _GW_OK = False
+    if url:
+        try:
+            r = httpx.post(url, json={"jsonrpc": "2.0", "id": 0,
+                                      "method": "tools/list"}, timeout=5)
+            _GW_OK = r.status_code < 400
+        except Exception:
+            _GW_OK = False
+    return _GW_OK
 
 
 def mcp_url() -> str:
     """The MCP endpoint this agent calls.
 
-    When an MCP proxy is attached, AMP injects the gateway URL for it as
-    <config-name>_MCP_CONFIG_URL. That URL is what the agent calls AND the
-    OAuth 2.0 target resource (RFC 8707) the token must be bound to, so it has
-    to be known before the token is minted, not just before the call.
+    Prefer the AMP gateway, so the gateway performs the authorization. That URL
+    is also the OAuth 2.0 target resource (RFC 8707) the token is bound to, so
+    it has to be settled before the token is minted, not just before the call.
 
-    MCP_URL is only a fallback for running outside AMP.
+    Falls back to the enforcement point directly when the gateway is not
+    serving the proxy, so the demo still runs; /whoami reports which is in use.
     """
-    injected = next((v for k, v in os.environ.items()
-                     if k.endswith("_MCP_CONFIG_URL") and v), "")
-    return injected or os.getenv("MCP_URL", "http://host.k3d.internal:8892/mcp")
+    gw = _gateway_url()
+    if _gateway_usable(gw):
+        return gw
+    return os.getenv("MCP_URL", "http://host.k3d.internal:8892/mcp")
 
 
 def mcp_token() -> str:
-    """An AgentID token bound to the MCP endpoint as its target resource.
-
-    The gateway authorizes the call against the scopes in this token, so the
-    resource has to be the endpoint being called.
-    """
+    """An AgentID token bound to the MCP endpoint as its target resource."""
     return agentid.get_token(resource=mcp_url())
 
 
@@ -104,9 +129,10 @@ async def whoami():
     info = {"agent": AGENT_ID, "runtime": RUNTIME,
             "agentid_configured": agentid.configured(),
             "scopes_from_amp": agentid.granted_scopes(),
-            "mcp_endpoint": mcp_url(),
-            "mcp_endpoint_is_amp_gateway": any(
-                k.endswith("_MCP_CONFIG_URL") and v for k, v in os.environ.items())}
+            "mcp_gateway_url": _gateway_url() or None,
+            "mcp_gateway_usable": _gateway_usable(_gateway_url()),
+            "mcp_endpoint_in_use": mcp_url(),
+            "via_amp_gateway": mcp_url() == _gateway_url() and bool(_gateway_url())}
     if agentid.configured():
         try:
             info["token_claims"] = {
