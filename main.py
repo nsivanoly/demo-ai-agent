@@ -150,4 +150,8 @@ async def health():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")), log_level="warning")
+    # AMP's inputInterface declares port 8000 and its readiness probe is a TCP
+    # check on 8000. The Google buildpack sets PORT=8080 in the image, so
+    # binding $PORT makes the probe fail and the pod is SIGTERMed. Bind 8000.
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("AGENT_PORT", "8000")),
+                log_level="info")

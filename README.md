@@ -51,5 +51,10 @@ python main.py           # serves on :8000
 ## Deploy on WSO2 Agent Manager
 
 Platform-hosted agent, buildpack `python` 3.11, run command `python main.py`,
-port 8000. `setup/demo.sh 2` does this automatically when `DEMO2_REPO_URL` is
+port 8000.
+
+> The app binds **8000 explicitly**, not `$PORT`. The Google buildpack sets
+> `PORT=8080` in the image, but AMP's readiness probe is a TCP check on the
+> port declared in `inputInterface` (8000) — binding `$PORT` makes the probe
+> fail and the pod is killed with SIGTERM. `setup/demo.sh 2` does this automatically when `DEMO2_REPO_URL` is
 set — this branch is the repo root, so the app path is `/`.
