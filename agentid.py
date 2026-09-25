@@ -28,7 +28,10 @@ import httpx
 CLIENT_ID = os.getenv("AMP_AGENTID_CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("AMP_AGENTID_CLIENT_SECRET", "")
 TOKEN_ENDPOINT = os.getenv("AMP_AGENTID_TOKEN_ENDPOINT", "")
-DEFAULT_SCOPES = os.getenv("AMP_AGENTID_SCOPES", "")
+# AMP computes AMP_AGENTID_SCOPES when the agent is created, which is before
+# any role is assigned, so it can arrive empty. AGENT_SCOPES is written by the
+# demo setup after role assignment and takes precedence when present.
+DEFAULT_SCOPES = os.getenv("AGENT_SCOPES") or os.getenv("AMP_AGENTID_SCOPES", "")
 RESOURCE = os.getenv("MCP_RESOURCE", "http://default-default.gateway.localhost:19080/mcp")
 
 _cache: Dict[Tuple[str, str], Tuple[str, float]] = {}
