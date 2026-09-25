@@ -148,7 +148,7 @@ async def task(req: TaskRequest,
 
     # ---- hop 2: this agent's own AMP identity ---------------------------
     try:
-        token = agentid.get_token(resource=gw)
+        token = agentid.get_token(resource=mcpgw.gateway_resource())
     except agentid.AgentIDError as exc:
         hop(steps, "agent -> AMP IdP", "AMP", "DENY", str(exc))
         return {"trace_id": trace_id, "status": "failed", "at": "agentid",
@@ -267,7 +267,7 @@ async def spawn(req: SpawnRequest,
     steps: List[Dict[str, Any]] = []
     gw = mcpgw.gateway_url()
     try:
-        parent_token = agentid.get_token(resource=gw)
+        parent_token = agentid.get_token(resource=mcpgw.gateway_resource())
     except agentid.AgentIDError as exc:
         return {"trace_id": trace_id, "status": "failed", "detail": str(exc)}
 
@@ -326,7 +326,7 @@ async def child_call(req: ChildCallRequest):
                 "steps": steps}
 
     gw = mcpgw.gateway_url()
-    parent_token = agentid.get_token(resource=gw)
+    parent_token = agentid.get_token(resource=mcpgw.gateway_resource())
     child_scopes = (c.get("scope") or "").split()
     needed = os.getenv("TOOL_SCOPE_" + req.tool, "")
     if needed and needed not in child_scopes:
@@ -357,14 +357,15 @@ async def whoami():
         "agent": AGENT_ID, "runtime": RUNTIME,
         "agentid_configured": agentid.configured(),
         "scopes_requested": agentid.granted_scopes(),
-        "mcp_gateway_url": gw or None,
+        "mcp_gateway": mcpgw.endpoints(),
         "calls_mcp_directly": False,
         "payments_agent": {"name": PAYMENTS_AGENT,
                            "internal": PAYMENTS_INTERNAL, "published": PAYMENTS_URL},
     }
     if agentid.configured() and gw:
         try:
-            info["token_claims"] = token_view(agentid.get_token(resource=gw))
+            info["token_claims"] = token_view(
+                agentid.get_token(resource=mcpgw.gateway_resource()))
         except Exception as exc:
             info["token_error"] = str(exc)
     return info
