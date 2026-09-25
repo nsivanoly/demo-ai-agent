@@ -1,8 +1,8 @@
 """
 AgentID helper for platform-hosted WSO2 Agent Manager agents.
 
-AMP injects these env vars into a platform-hosted agent; they are system-managed
-and must not be set by hand:
+AMP injects these into a platform-hosted agent; they are system-managed and
+must never be set by hand:
 
     AMP_AGENTID_CLIENT_ID
     AMP_AGENTID_CLIENT_SECRET
@@ -10,18 +10,29 @@ and must not be set by hand:
     AMP_AGENTID_SCOPES
 
 The token comes from the OAuth 2.0 client_credentials grant. `resource` is
-RFC 8707 target-resource indication -- ThunderID scopes the token to that one
-resource, so tokens are cached per resource rather than globally. AMP filters
-the granted scopes against the agent's assigned roles at mint time, so the
-token that comes back is the authoritative statement of what this agent may do.
+RFC 8707 target-resource indication: the token is bound to the endpoint it will
+be presented to, which is how the gateway knows the token was meant for it.
+That endpoint has to be a resource the identity provider has registered -- the
+MCP proxy's gateway URL -- otherwise the token endpoint answers
+
+    {"error":"invalid_target",
+     "error_description":"The resource parameter does not match any
+                          registered resource server"}
+
+AMP filters the granted scopes against the agent's assigned roles at mint time,
+so the token that comes back is the authoritative statement of what this agent
+may do. Asking for more than the roles allow does not fail -- the extra scopes
+are simply absent from the response.
 """
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 import threading
 import time
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
@@ -32,7 +43,6 @@ TOKEN_ENDPOINT = os.getenv("AMP_AGENTID_TOKEN_ENDPOINT", "")
 # any role is assigned, so it can arrive empty. AGENT_SCOPES is written by the
 # demo setup after role assignment and takes precedence when present.
 DEFAULT_SCOPES = os.getenv("AGENT_SCOPES") or os.getenv("AMP_AGENTID_SCOPES", "")
-RESOURCE = os.getenv("MCP_RESOURCE", "http://default-default.gateway.localhost:19080/mcp")
 
 _cache: Dict[Tuple[str, str], Tuple[str, float]] = {}
 _lock = threading.Lock()
@@ -46,7 +56,15 @@ def configured() -> bool:
     return bool(CLIENT_ID and CLIENT_SECRET and TOKEN_ENDPOINT)
 
 
-def get_token(scopes: Optional[str] = None, resource: Optional[str] = None) -> str:
+def claims(token: str) -> Dict[str, Any]:
+    try:
+        p = token.split(".")[1]
+        return json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4)))
+    except Exception:
+        return {}
+
+
+def get_token(scopes: Optional[str] = None, resource: str = "") -> str:
     """Fetch (and cache) an AgentID access token for one resource."""
     if not configured():
         raise AgentIDError(
@@ -54,10 +72,8 @@ def get_token(scopes: Optional[str] = None, resource: Optional[str] = None) -> s
             "AMP_AGENTID_CLIENT_SECRET and AMP_AGENTID_TOKEN_ENDPOINT into "
             "platform-hosted agents.")
 
-    scope = scopes if scopes is not None else DEFAULT_SCOPES
-    res = resource or RESOURCE
-    key = (scope, res)
-
+    scope = DEFAULT_SCOPES if scopes is None else scopes
+    key = (scope, resource)
     with _lock:
         hit = _cache.get(key)
         if hit and hit[1] > time.time():
@@ -66,8 +82,8 @@ def get_token(scopes: Optional[str] = None, resource: Optional[str] = None) -> s
     data = {"grant_type": "client_credentials"}
     if scope:
         data["scope"] = scope
-    if res:
-        data["resource"] = res
+    if resource:
+        data["resource"] = resource
 
     resp = httpx.post(TOKEN_ENDPOINT, data=data,
                       auth=(CLIENT_ID, CLIENT_SECRET), timeout=20)
@@ -76,11 +92,17 @@ def get_token(scopes: Optional[str] = None, resource: Optional[str] = None) -> s
 
     body = resp.json()
     token = body["access_token"]
-    ttl = float(body.get("expires_in", 3600))     # refresh at 75% of lifetime
-    with _lock:
+    ttl = float(body.get("expires_in", 3600))
+    with _lock:                                   # refresh at 75% of lifetime
         _cache[key] = (token, time.time() + ttl * 0.75)
     return token
 
 
 def granted_scopes() -> str:
     return DEFAULT_SCOPES
+
+
+def forget() -> None:
+    """Drop cached tokens -- used after a role change so the next mint is fresh."""
+    with _lock:
+        _cache.clear()

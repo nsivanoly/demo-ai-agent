@@ -1,116 +1,92 @@
-openapi: 3.1.0
+openapi: 3.0.3
 info:
-  title: Payments Agent
-  version: 1.0.0
-  description: Agent API for the WSO2 Agent Manager identity and trust demo. The agent authenticates with
-    a real AgentID token whose scopes AMP filters against its assigned roles.
+  title: Demo 2 Payments Agent
+  version: 2.0.0
+  description: >-
+    Confidential-tier specialist for the WSO2 Agent Manager identity and trust
+    demo. Reached only through an on-behalf-of assertion from a trusted
+    delegating agent. It verifies that assertion, then mints its OWN AgentID
+    token for the MCP call, so the scopes the gateway authorizes come from this
+    agent's AMP roles rather than from anything the caller asserted.
+servers:
+  - url: /
 paths:
   /settle:
     post:
-      summary: Settle
-      description: Act under the delegated credential, on a vault reference only.
-      operationId: settle_settle_post
+      summary: Settle a payment against an opaque vault reference
+      security:
+        - oboAssertion: []
       requestBody:
+        required: true
         content:
           application/json:
             schema:
               $ref: '#/components/schemas/SettleRequest'
-        required: true
       responses:
         '200':
-          description: Successful Response
-          content:
-            application/json:
-              schema: {}
-        '422':
-          description: Validation Error
+          description: The settlement outcome and the hops it took
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/HTTPValidationError'
+                $ref: '#/components/schemas/SettleResponse'
   /whoami:
     get:
-      summary: Whoami
-      operationId: whoami_whoami_get
+      summary: This agent's AMP identity, granted scopes and MCP gateway endpoint
       responses:
         '200':
-          description: Successful Response
+          description: Identity summary
           content:
             application/json:
-              schema: {}
+              schema:
+                type: object
   /health:
     get:
-      summary: Health
-      operationId: health_health_get
+      summary: Liveness
       responses:
         '200':
-          description: Successful Response
+          description: Healthy
           content:
             application/json:
-              schema: {}
+              schema:
+                type: object
+                properties:
+                  status: {type: string}
+                  service: {type: string}
 components:
+  securitySchemes:
+    oboAssertion:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >-
+        On-behalf-of assertion minted by the delegating agent. Carries the user
+        as `sub`, the delegating agent as `act.sub`, this agent as `aud`, the
+        narrowed scope and the delegation chain.
   schemas:
-    HTTPValidationError:
-      properties:
-        detail:
-          items:
-            $ref: '#/components/schemas/ValidationError'
-          type: array
-          title: Detail
-      type: object
-      title: HTTPValidationError
     SettleRequest:
+      type: object
       properties:
-        delegated_token:
-          type: string
-          title: Delegated Token
-        amount:
-          type: number
-          title: Amount
+        amount: {type: number, default: 249.00}
         payment_ref:
           type: string
-          title: Payment Ref
           default: tok_card_9931
-        user:
-          type: string
-          title: User
-          default: alice@example.com
-        trace_id:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Trace Id
+          description: Opaque vault reference. A card number here is refused by a guardrail.
+        trace_id: {type: string}
+    SettleResponse:
       type: object
-      required:
-      - delegated_token
-      - amount
-      title: SettleRequest
-    ValidationError:
       properties:
-        loc:
-          items:
-            anyOf:
-            - type: string
-            - type: integer
+        status: {type: string}
+        agent: {type: string}
+        trace_id: {type: string}
+        acting_for: {type: string}
+        delegation_chain:
           type: array
-          title: Location
-        msg:
+          items: {type: string}
+        payment_ref_used: {type: string}
+        card_number_seen_by_agent:
           type: string
-          title: Message
-        type:
-          type: string
-          title: Error Type
-        input:
-          title: Input
-        ctx:
-          type: object
-          title: Context
-      type: object
-      required:
-      - loc
-      - msg
-      - type
-      title: ValidationError
-servers:
-- url: /
-  description: Agent base path
+          nullable: true
+        receipt: {type: object}
+        steps:
+          type: array
+          items: {type: object}
