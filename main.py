@@ -81,8 +81,16 @@ def mcp_url() -> str:
 
 
 def mcp_token() -> str:
-    """An AgentID token bound to the MCP endpoint as its target resource."""
-    return agentid.get_token(resource=mcp_url())
+    """An AgentID token bound to the MCP resource registered in AMP.
+
+    The RFC 8707 resource must be a target AMP knows about -- the gateway URL
+    from the proxy binding. Binding it to the direct fallback URL instead makes
+    the token endpoint reject the request with 400, because that URL is not a
+    registered resource. So the resource stays the gateway URL even when the
+    call itself falls back to the enforcement point.
+    """
+    resource = _gateway_url() or os.getenv("MCP_RESOURCE", "")
+    return agentid.get_token(resource=resource or None)
 
 
 def new_trace() -> str:
