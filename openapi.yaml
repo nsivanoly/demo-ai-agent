@@ -1,0 +1,176 @@
+openapi: 3.1.0
+info:
+  title: Concierge Agent
+  version: 1.0.0
+  description: Agent API for the WSO2 Agent Manager identity and trust demo. The agent authenticates with
+    a real AgentID token whose scopes AMP filters against its assigned roles.
+paths:
+  /task:
+    post:
+      summary: Task
+      description: User -> this agent. It does what its own scopes allow, delegates the rest.
+      operationId: task_task_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /spawn:
+    post:
+      summary: Spawn
+      description: Ask the broker for a short-lived child identity with a subset of scopes.
+      operationId: spawn_spawn_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SpawnRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /whoami:
+    get:
+      summary: Whoami
+      description: What this agent's real AMP identity actually permits.
+      operationId: whoami_whoami_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+  /health:
+    get:
+      summary: Health
+      operationId: health_health_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+components:
+  schemas:
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          type: array
+          title: Detail
+      type: object
+      title: HTTPValidationError
+    SpawnRequest:
+      properties:
+        purpose:
+          type: string
+          title: Purpose
+          default: summarise recent orders
+        scopes:
+          items:
+            type: string
+          type: array
+          title: Scopes
+          default: []
+        ttl_seconds:
+          type: integer
+          title: Ttl Seconds
+          default: 30
+        trace_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Trace Id
+      type: object
+      title: SpawnRequest
+    TaskRequest:
+      properties:
+        user:
+          type: string
+          title: User
+          default: alice@example.com
+        intent:
+          type: string
+          title: Intent
+          default: pay
+        order_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Order Id
+          default: ORD-77001
+        customer_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Customer Id
+          default: CUST-1001
+        amount:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Amount
+          default: 249.0
+        payment_ref:
+          type: string
+          title: Payment Ref
+          default: tok_card_9931
+        trace_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Trace Id
+      type: object
+      title: TaskRequest
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          type: array
+          title: Location
+        msg:
+          type: string
+          title: Message
+        type:
+          type: string
+          title: Error Type
+        input:
+          title: Input
+        ctx:
+          type: object
+          title: Context
+      type: object
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError
+servers:
+- url: /
+  description: Agent base path

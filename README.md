@@ -50,8 +50,20 @@ python main.py           # serves on :8000
 
 ## Deploy on WSO2 Agent Manager
 
-Platform-hosted agent, buildpack `python` 3.11, run command `python main.py`,
-port 8000.
+Platform-hosted agent, **subtype `custom-api`**, buildpack `python` 3.11, run
+command `python main.py`, port 8000, base path `/`, OpenAPI spec
+`/openapi.yaml`.
+
+`custom-api` is the honest subtype here — this agent exposes a task API, not a
+chat endpoint. AMP then requires the interface to be described, which is what
+`openapi.yaml` is for. It is generated from the FastAPI app, so regenerate it
+after changing any route:
+
+```bash
+PYTHONPATH=. python -c "
+import main, yaml
+yaml.safe_dump(main.app.openapi(), open('openapi.yaml','w'), sort_keys=False)"
+```
 
 > The app binds **8000 explicitly**, not `$PORT`. The Google buildpack sets
 > `PORT=8080` in the image, but AMP's readiness probe is a TCP check on the
