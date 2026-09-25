@@ -1,176 +1,151 @@
-openapi: 3.1.0
+openapi: 3.0.3
 info:
-  title: Concierge Agent
-  version: 1.0.0
-  description: Agent API for the WSO2 Agent Manager identity and trust demo. The agent authenticates with
-    a real AgentID token whose scopes AMP filters against its assigned roles.
+  title: Demo 2 Concierge Agent
+  version: 2.0.0
+  description: >-
+    User-facing orchestrator for the WSO2 Agent Manager identity and trust demo.
+    Accepts a user's OIDC token, verifies it against the issuer's JWKS, acts
+    under its own AgentID within the scopes AMP granted it, and delegates
+    confidential work to the payments agent with an on-behalf-of assertion.
+    Every MCP tool call goes through the Agent Manager gateway.
+servers:
+  - url: /
 paths:
   /task:
     post:
-      summary: Task
-      description: User -> this agent. It does what its own scopes allow, delegates the rest.
-      operationId: task_task_post
+      summary: Run one end-to-end transaction on behalf of the calling user
+      security:
+        - userToken: []
       requestBody:
+        required: true
         content:
           application/json:
             schema:
               $ref: '#/components/schemas/TaskRequest'
-        required: true
       responses:
         '200':
-          description: Successful Response
-          content:
-            application/json:
-              schema: {}
-        '422':
-          description: Validation Error
+          description: The transaction record, one entry per hop
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/HTTPValidationError'
+                $ref: '#/components/schemas/TaskResponse'
   /spawn:
     post:
-      summary: Spawn
-      description: Ask the broker for a short-lived child identity with a subset of scopes.
-      operationId: spawn_spawn_post
+      summary: Issue a short-lived child identity with a subset of this agent's scopes
       requestBody:
+        required: true
         content:
           application/json:
             schema:
               $ref: '#/components/schemas/SpawnRequest'
-        required: true
       responses:
         '200':
-          description: Successful Response
-          content:
-            application/json:
-              schema: {}
-        '422':
-          description: Validation Error
+          description: The child identity, or the reason it was refused
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/HTTPValidationError'
+                type: object
+  /child-call:
+    post:
+      summary: Act under a previously issued child identity
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [assertion]
+              properties:
+                assertion: {type: string}
+                tool: {type: string, default: get_order}
+                arguments: {type: object, additionalProperties: true}
+                trace_id: {type: string}
+      responses:
+        '200':
+          description: The outcome of the call
+          content:
+            application/json:
+              schema:
+                type: object
   /whoami:
     get:
-      summary: Whoami
-      description: What this agent's real AMP identity actually permits.
-      operationId: whoami_whoami_get
+      summary: This agent's AMP identity, granted scopes and MCP gateway endpoint
       responses:
         '200':
-          description: Successful Response
+          description: Identity summary
           content:
             application/json:
-              schema: {}
+              schema:
+                type: object
   /health:
     get:
-      summary: Health
-      operationId: health_health_get
+      summary: Liveness
       responses:
         '200':
-          description: Successful Response
+          description: Healthy
           content:
             application/json:
-              schema: {}
+              schema:
+                type: object
+                properties:
+                  status: {type: string}
+                  service: {type: string}
 components:
+  securitySchemes:
+    userToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: The calling user's OIDC access token.
   schemas:
-    HTTPValidationError:
-      properties:
-        detail:
-          items:
-            $ref: '#/components/schemas/ValidationError'
-          type: array
-          title: Detail
-      type: object
-      title: HTTPValidationError
-    SpawnRequest:
-      properties:
-        purpose:
-          type: string
-          title: Purpose
-          default: summarise recent orders
-        scopes:
-          items:
-            type: string
-          type: array
-          title: Scopes
-          default: []
-        ttl_seconds:
-          type: integer
-          title: Ttl Seconds
-          default: 30
-        trace_id:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Trace Id
-      type: object
-      title: SpawnRequest
     TaskRequest:
+      type: object
       properties:
-        user:
-          type: string
-          title: User
-          default: alice@example.com
         intent:
           type: string
-          title: Intent
           default: pay
-        order_id:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Order Id
-          default: ORD-77001
-        customer_id:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Customer Id
-          default: CUST-1001
-        amount:
-          anyOf:
-          - type: number
-          - type: 'null'
-          title: Amount
-          default: 249.0
-        payment_ref:
-          type: string
-          title: Payment Ref
-          default: tok_card_9931
-        trace_id:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Trace Id
-      type: object
-      title: TaskRequest
-    ValidationError:
-      properties:
-        loc:
-          items:
-            anyOf:
-            - type: string
-            - type: integer
+          description: '"pay" runs the full chain; "read" stops after this agent''s own work.'
+        order_id: {type: string, default: ORD-77001}
+        customer_id: {type: string, default: CUST-1001}
+        amount: {type: number, default: 249.00}
+        payment_ref: {type: string, default: tok_card_9931}
+        trace_id: {type: string}
+        request_scopes:
           type: array
-          title: Location
-        msg:
-          type: string
-          title: Message
-        type:
-          type: string
-          title: Error Type
-        input:
-          title: Input
-        ctx:
-          type: object
-          title: Context
+          items: {type: string}
+          description: Scopes to delegate, instead of the configured confidential scope.
+        skip_delegation:
+          type: boolean
+          default: false
+          description: Attempt the confidential tool with this agent's own token.
+        obo_ttl: {type: integer, default: 120}
+    SpawnRequest:
       type: object
-      required:
-      - loc
-      - msg
-      - type
-      title: ValidationError
-servers:
-- url: /
-  description: Agent base path
+      properties:
+        purpose: {type: string}
+        scopes:
+          type: array
+          items: {type: string}
+        ttl_seconds: {type: integer, default: 8}
+        trace_id: {type: string}
+    TaskResponse:
+      type: object
+      properties:
+        trace_id: {type: string}
+        status: {type: string}
+        agent: {type: string}
+        user: {type: object}
+        delegation_chain:
+          type: array
+          items: {type: string}
+        receipt: {type: object}
+        steps:
+          type: array
+          items:
+            type: object
+            properties:
+              seq: {type: integer}
+              hop: {type: string}
+              credential: {type: string, enum: [USER, AMP, DEMO, 'AMP+DEMO']}
+              decision: {type: string}
+              detail: {type: string}

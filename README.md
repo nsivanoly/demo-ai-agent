@@ -1,83 +1,69 @@
-# Concierge Agent
+# Demo 2 — Concierge Agent
 
-The user-facing orchestrator for the WSO2 Agent Manager identity & trust demo.
-Deployed as a **platform-hosted** agent, so it runs inside AMP with a real
-AgentID.
+The user-facing orchestrator for the WSO2 Agent Manager identity and trust
+demo. Runs as a **platform-hosted** agent: Agent Manager builds this branch,
+runs it in the cluster, and injects its AgentID credentials.
+
+## The chain it drives
 
 ```
-main.py         FastAPI app  (POST /task, POST /spawn, GET /whoami, GET /health)
-agentid.py      AgentID client-credentials helper
+user token (OIDC)            verified against the issuer's live JWKS
+  → AgentID token            client_credentials, scopes filtered by AMP roles
+  → AMP gateway → MCP        work this agent is entitled to do itself
+  → OBO assertion            minted for the payments agent, narrowed scope
+  → payments agent           which mints its OWN AgentID token
+  → AMP gateway → MCP        the confidential call
 ```
 
-## Identity
+`POST /task` returns one record per hop: the credential used, the decision, who
+made it, and the token content. That response *is* the audit trail.
 
-The agent holds no credential of its own. AMP injects:
+## What it deliberately cannot do
 
-| Variable | |
-|---|---|
-| `AMP_AGENTID_CLIENT_ID` | OAuth client id for this environment |
-| `AMP_AGENTID_CLIENT_SECRET` | client secret, via a Kubernetes secret reference |
-| `AMP_AGENTID_TOKEN_ENDPOINT` | the environment ThunderID's `/oauth2/token` |
-| `AMP_AGENTID_SCOPES` | the scopes to request |
-
-`agentid.py` exchanges them for an access token using the `client_credentials`
-grant, with RFC 8707 `resource` targeting so the token is bound to one resource,
-cached per resource and refreshed at 75% of its lifetime.
-
-**AMP filters the scopes in that token against the roles assigned to this
-agent.** Remove a role in the Console and the scope is gone from the next token.
-
-This agent deliberately holds only low-sensitivity scopes. Anything higher is
-delegated to the payments agent.
-
-## How it reaches the MCP server
-
-AMP attaches the MCP proxy to this agent and injects the gateway URL as
-`<config-name>_MCP_CONFIG_URL`. `mcp_url()` prefers that, so the moment the
-proxy reconciles onto the gateway the traffic flows through AMP with no code
-change. On the current build the gateway returns 404 for MCP proxies, so it
-falls back to `MCP_URL` — the enforcement point directly.
-
-Either way the authorization is identical: the agent presents its real AgentID
-token and the enforcement point checks the scopes AMP put in it.
+This agent holds read scopes only. Ask it to charge a card with its own token
+(`{"skip_delegation": true}`) and the **gateway** returns 403 before the MCP
+server is reached. Delegation here is forced by the authorization model, not
+staged for the demo.
 
 ## Endpoints
 
+| | |
+|---|---|
+| `POST /task` | Run one transaction on behalf of the calling user. Send the user's OIDC token as `Authorization: Bearer`. |
+| `POST /spawn` | Issue a short-lived child identity with a subset of this agent's scopes. Asking for more than the parent holds is refused at issue time. |
+| `POST /child-call` | Act under a previously issued child identity. |
+| `GET /whoami` | This agent's AMP identity, granted scopes and gateway endpoint. |
+| `GET /health` | Liveness. AMP's readiness probe is a TCP check on port 8000. |
+
+## Configuration
+
+AMP injects these; never set them by hand:
+
 ```
-POST /task     run a task; delegates what it is not entitled to do
-POST /spawn    ask the broker for a short-lived sub-agent identity
-GET  /whoami   the live AgentID token claims  <- useful during a demo
-GET  /health
-```
-
-## Run locally
-
-```bash
-python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env     # fill in the AgentID values from the Console
-python main.py           # serves on :8000
-```
-
-## Deploy on WSO2 Agent Manager
-
-Platform-hosted agent, **subtype `custom-api`**, buildpack `python` 3.11, run
-command `python main.py`, port 8000, base path `/`, OpenAPI spec
-`/openapi.yaml`.
-
-`custom-api` is the honest subtype here — this agent exposes a task API, not a
-chat endpoint. AMP then requires the interface to be described, which is what
-`openapi.yaml` is for. It is generated from the FastAPI app, so regenerate it
-after changing any route:
-
-```bash
-PYTHONPATH=. python -c "
-import main, yaml
-yaml.safe_dump(main.app.openapi(), open('openapi.yaml','w'), sort_keys=False)"
+AMP_AGENTID_CLIENT_ID  AMP_AGENTID_CLIENT_SECRET
+AMP_AGENTID_TOKEN_ENDPOINT  AMP_AGENTID_SCOPES
+<CONFIG>_MCP_CONFIG_URL      the gateway URL for the bound MCP proxy
 ```
 
-> The app binds **8000 explicitly**, not `$PORT`. The Google buildpack sets
-> `PORT=8080` in the image, but AMP's readiness probe is a TCP check on the
-> port declared in `inputInterface` (8000) — binding `$PORT` makes the probe
-> fail and the pod is killed with SIGTERM. `setup/demo.sh 2` does this automatically when `DEMO2_REPO_URL` is
-set — this branch is the repo root, so the app path is `/`.
+The demo setup writes these after roles are assigned:
+
+```
+AGENT_SCOPES        what to request — AMP_AGENTID_SCOPES is computed at agent
+                    creation, before any role exists, so it arrives empty
+MCP_GATEWAY_URL     fallback for the injected URL
+OBO_SIGNING_KEY     shared with the payments agent, rotated per setup run
+USER_TOKEN_ISSUER   whose JWKS to verify the user's token against
+PAYMENTS_AGENT_URL  where the payments agent answers
+```
+
+## Notes that cost time to learn
+
+* **Bind port 8000, not `$PORT`.** The buildpack sets `PORT=8080`, but AMP's
+  readiness probe is a TCP check on the port declared in `inputInterface`. Bind
+  `$PORT` and the pod is SIGTERMed with nothing in the log.
+* **The RFC 8707 `resource` must be the gateway URL.** The identity provider
+  only accepts a resource it has registered; anything else fails with
+  `invalid_target`.
+* **There is no direct-to-MCP fallback.** The gateway is the policy enforcement
+  point. A fallback around it would make the demo prove something weaker than
+  it claims, so a gateway that is not serving the proxy fails the call loudly.

@@ -6,202 +6,365 @@ AgentID: AMP injects the client credentials, the agent exchanges them for an
 access token, and AMP filters the scopes in that token against the roles the
 agent has been assigned.
 
-It deliberately does NOT hold the confidential-tier scope. Work that needs it
-is delegated to the payments agent -- which is the point of the delegation
-scenario, and a capability AMP v1.0.0 has no primitive for (hence the broker).
+It holds read scopes and nothing more. Anything confidential it must get done
+by the payments agent, which is the point: the delegation is forced by the
+authorization model, not staged.
+
+The chain it drives, per request:
+
+    user token (OIDC, verified against the issuer's JWKS)
+      -> AgentID token, bound to the MCP gateway as its RFC 8707 resource
+      -> gateway -> MCP server            (work this agent may do itself)
+      -> OBO assertion for the payments agent
+      -> payments agent
+      -> its own AgentID token -> gateway -> MCP server
+
+Every hop is recorded with the credential it used and the decision that was
+made, so the response is the audit record for the whole transaction.
 """
 
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
 import httpx
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Header
 from pydantic import BaseModel
 
 import agentid
+import mcpgw
+import obo
+import userauth
 
-app = FastAPI(title="Concierge Agent", version="1.0.0")
+app = FastAPI(title="Concierge Agent", version="2.0.0")
 
-AGENT_ID = os.getenv("AGENT_NAME", "concierge-agent")
+AGENT_ID = os.getenv("AGENT_NAME", "demo2-concierge-agent")
 RUNTIME = os.getenv("AGENT_RUNTIME", "runtime-a")
-MCP_URL = os.getenv("MCP_URL", "http://host.k3d.internal:8892/mcp")
-# resolved lazily so the AMP-injected gateway URL is preferred when usable
-BROKER_URL = os.getenv("BROKER_URL", "http://host.k3d.internal:8890")
-PAYMENTS_URL = os.getenv("PAYMENTS_AGENT_URL", "http://host.k3d.internal:8894")
-LOW_TOOL = os.getenv("LOW_TOOL", "process_order")
-_GW_OK = None
+PAYMENTS_AGENT = os.getenv("PAYMENTS_AGENT_NAME", "demo2-payments-agent")
+PAYMENTS_URL = os.getenv("PAYMENTS_AGENT_URL", "")
+PAYMENTS_INTERNAL = os.getenv("PAYMENTS_AGENT_INTERNAL_URL",
+                              "http://demo2-payments-agent:8000")
+LOW_TOOL = os.getenv("LOW_TOOL", "get_order")
 CONFIDENTIAL_SCOPE = os.getenv("CONFIDENTIAL_SCOPE", "")
+REQUIRE_USER_TOKEN = os.getenv("REQUIRE_USER_TOKEN", "true").lower() != "false"
 
-
-def _gateway_url() -> str:
-    """The MCP gateway URL AMP injects for this agent's proxy binding."""
-    return next((v for k, v in os.environ.items()
-                 if k.endswith("_MCP_CONFIG_URL") and v), "")
-
-
-def _gateway_usable(url: str) -> bool:
-    """Is the AMP gateway actually serving the MCP proxy?
-
-    On builds where the proxy has not reconciled onto the gateway there is no
-    Mcp artifact, so the route 404s -- and the injected hostname does not even
-    resolve from inside the cluster. Probe once and cache.
-    """
-    global _GW_OK
-    if _GW_OK is not None:
-        return _GW_OK
-    _GW_OK = False
-    if url:
-        try:
-            r = httpx.post(url, json={"jsonrpc": "2.0", "id": 0,
-                                      "method": "tools/list"}, timeout=5)
-            _GW_OK = r.status_code < 400
-        except Exception:
-            _GW_OK = False
-    return _GW_OK
-
-
-def mcp_url() -> str:
-    """The MCP endpoint this agent calls.
-
-    Prefer the AMP gateway, so the gateway performs the authorization. That URL
-    is also the OAuth 2.0 target resource (RFC 8707) the token is bound to, so
-    it has to be settled before the token is minted, not just before the call.
-
-    Falls back to the enforcement point directly when the gateway is not
-    serving the proxy, so the demo still runs; /whoami reports which is in use.
-    """
-    gw = _gateway_url()
-    if _gateway_usable(gw):
-        return gw
-    return os.getenv("MCP_URL", "http://host.k3d.internal:8892/mcp")
-
-
-def mcp_token() -> str:
-    """An AgentID token bound to the MCP resource registered in AMP.
-
-    The RFC 8707 resource must be a target AMP knows about -- the gateway URL
-    from the proxy binding. Binding it to the direct fallback URL instead makes
-    the token endpoint reject the request with 400, because that URL is not a
-    registered resource. So the resource stays the gateway URL even when the
-    call itself falls back to the enforcement point.
-    """
-    resource = _gateway_url() or os.getenv("MCP_RESOURCE", "")
-    return agentid.get_token(resource=resource or None)
+_payments_base: Optional[str] = None
 
 
 def new_trace() -> str:
     return "txn-" + uuid.uuid4().hex[:16]
 
 
-async def call_tool(client: httpx.AsyncClient, token: str, trace_id: str,
-                    tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
-    r = await client.post(mcp_url(),
-                          json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                                "params": {"name": tool, "arguments": args}},
-                          headers={"Authorization": f"Bearer {token}",
-                                   "X-Agent-Runtime": RUNTIME,
-                                   "X-Trace-Id": trace_id})
-    return r.json()
+def hop(steps: List[Dict[str, Any]], name: str, credential: str,
+        decision: str, detail: str, **extra: Any) -> Dict[str, Any]:
+    row = {"seq": len(steps) + 1, "hop": name, "credential": credential,
+           "decision": decision, "detail": detail,
+           "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    row.update(extra)
+    steps.append(row)
+    return row
+
+
+def token_view(tok: str) -> Dict[str, Any]:
+    """The parts of a token worth showing at a hop."""
+    c = agentid.claims(tok)
+    return {k: c.get(k) for k in ("iss", "sub", "aud", "scope", "act",
+                                  "delegation_chain", "exp") if c.get(k) is not None}
+
+
+async def payments_base(client: httpx.AsyncClient) -> str:
+    """Where the payments agent answers.
+
+    Prefer the in-cluster service, which is the hop a deployed agent would
+    really take; fall back to the endpoint AMP publishes. Probed once.
+    """
+    global _payments_base
+    if _payments_base is not None:
+        return _payments_base
+    for candidate in (PAYMENTS_INTERNAL, PAYMENTS_URL):
+        if not candidate:
+            continue
+        try:
+            r = await client.get(f"{candidate.rstrip('/')}/health", timeout=5)
+            if r.status_code < 400:
+                _payments_base = candidate.rstrip("/")
+                return _payments_base
+        except Exception:
+            continue
+    _payments_base = (PAYMENTS_URL or PAYMENTS_INTERNAL).rstrip("/")
+    return _payments_base
 
 
 class TaskRequest(BaseModel):
-    user: str = "alice@example.com"
-    intent: str = "pay"
-    order_id: Optional[str] = "ORD-77001"
-    customer_id: Optional[str] = "CUST-1001"
-    amount: Optional[float] = 249.00
+    intent: str = "pay"                # "read" stops after the agent's own work
+    order_id: str = "ORD-77001"
+    customer_id: str = "CUST-1001"
+    amount: float = 249.00
     payment_ref: str = "tok_card_9931"
     trace_id: Optional[str] = None
+    # Scenario levers. Each one changes what the flow does, so a scenario is a
+    # variation of this single chain rather than a script of its own.
+    request_scopes: Optional[List[str]] = None   # ask to delegate specific scopes
+    skip_delegation: bool = False                # try the confidential tool itself
+    obo_ttl: int = 120
 
 
 @app.post("/task")
-async def task(req: TaskRequest):
-    """User -> this agent. It does what its own scopes allow, delegates the rest."""
+async def task(req: TaskRequest,
+               authorization: Optional[str] = Header(default=None)):
+    """User -> this agent -> payments agent -> gateway -> MCP."""
     trace_id = req.trace_id or new_trace()
     steps: List[Dict[str, Any]] = []
+    gw = mcpgw.gateway_url()
 
-    try:
-        token = mcp_token()
-    except agentid.AgentIDError as exc:
-        return {"trace_id": trace_id, "status": "failed", "at": "agentid",
-                "detail": str(exc)}
-    steps.append({"hop": "agentid", "action": "AgentID token minted",
-                  "scopes": agentid.granted_scopes(), "credential": "AMP",
-                  "resource": mcp_url()})
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        # --- work this agent is entitled to do itself --------------------
-        out = await call_tool(client, token, trace_id, LOW_TOOL,
-                              {"order_id": req.order_id, "name": req.user})
-        steps.append({"hop": "agent -> mcp", "tool": LOW_TOOL, "result": out})
-
-        if req.intent != "pay":
-            return {"trace_id": trace_id, "status": "ok", "agent": AGENT_ID, "steps": steps}
-
-        # --- work it is NOT entitled to do: delegate ----------------------
-        d = await client.post(f"{BROKER_URL}/agents/{AGENT_ID}/delegate",
-                              json={"to_agent": "payments-agent",
-                                    "scopes": [CONFIDENTIAL_SCOPE],
-                                    "user": req.user, "trace_id": trace_id})
-        if d.status_code != 200:
-            steps.append({"hop": "agent -> broker", "action": "delegate",
-                          "decision": "DENY", "detail": d.json()})
-            return {"trace_id": trace_id, "status": "failed", "at": "delegation",
+    # ---- hop 1: the user ------------------------------------------------
+    bearer = (authorization or "")[7:] if (authorization or "").lower().startswith("bearer ") else ""
+    if not bearer:
+        if REQUIRE_USER_TOKEN:
+            hop(steps, "user -> agent", "USER", "DENY",
+                "no user token presented on the request")
+            return {"trace_id": trace_id, "status": "denied", "at": "user",
+                    "steps": steps}
+        user = {"username": "anonymous", "sub": "anonymous"}
+        hop(steps, "user -> agent", "USER", "ALLOW",
+            "running without a user token (REQUIRE_USER_TOKEN=false)")
+    else:
+        try:
+            userauth.verify(bearer, issuer=os.getenv("USER_TOKEN_ISSUER") or None)
+            user = userauth.identity(bearer)
+            hop(steps, "user -> agent", "USER", "ALLOW",
+                f"user token verified against {user['issuer']}/oauth2/jwks",
+                actor=user["username"], token=userauth.identity(bearer))
+        except userauth.UserAuthError as exc:
+            user = userauth.identity(bearer)
+            hop(steps, "user -> agent", "USER", "DENY", str(exc),
+                actor=user.get("username"))
+            return {"trace_id": trace_id, "status": "denied", "at": "user",
                     "steps": steps}
 
-        dj = d.json()
-        steps.append({"hop": "agent -> broker", "action": "delegate", "decision": "ALLOW",
-                      "delegation_chain": dj["delegation_chain"],
-                      "delegated_scope": dj["scope"], "credential": "DEMO"})
+    # ---- hop 2: this agent's own AMP identity ---------------------------
+    try:
+        token = agentid.get_token(resource=gw)
+    except agentid.AgentIDError as exc:
+        hop(steps, "agent -> AMP IdP", "AMP", "DENY", str(exc))
+        return {"trace_id": trace_id, "status": "failed", "at": "agentid",
+                "steps": steps}
+    my_scopes = (agentid.claims(token).get("scope") or "").split()
+    hop(steps, "agent -> AMP IdP", "AMP", "ALLOW",
+        "client_credentials; AMP filtered the scopes against assigned roles",
+        actor=AGENT_ID, token=token_view(token))
 
-        b = await client.post(f"{PAYMENTS_URL}/settle",
-                              json={"delegated_token": dj["access_token"],
-                                    "amount": req.amount, "payment_ref": req.payment_ref,
-                                    "user": req.user, "trace_id": trace_id})
-        steps.append({"hop": "agent -> payments-agent", "result": b.json()})
+    async with httpx.AsyncClient(timeout=60) as client:
+        ctx = {"trace_id": trace_id, "actor": AGENT_ID, "runtime": RUNTIME,
+               "user": user.get("username"), "chain": [user.get("username"), AGENT_ID]}
 
-    return {"trace_id": trace_id, "status": "ok", "agent": AGENT_ID, "steps": steps}
+        # ---- hop 3: work this agent is entitled to do itself -------------
+        out = mcpgw.call_tool(token, LOW_TOOL, {"order_id": req.order_id},
+                              trace_id=trace_id, context=ctx, url=gw)
+        d = mcpgw.decision(out)
+        hop(steps, "agent -> gateway -> mcp", "AMP",
+            "ALLOW" if d["allowed"] else "DENY",
+            f"{LOW_TOOL}: {d['reason']}", decided_by=d["by"],
+            http_status=d["status"], result=d.get("result"), endpoint=gw)
+
+        if req.skip_delegation:
+            # Deliberately attempt the confidential tool with this agent's own
+            # token. The gateway is what refuses it.
+            conf = os.getenv("CONFIDENTIAL_TOOL", "charge_card")
+            out = mcpgw.call_tool(token, conf,
+                                  {"payment_ref": req.payment_ref,
+                                   "amount": req.amount},
+                                  trace_id=trace_id, context=ctx, url=gw)
+            d = mcpgw.decision(out)
+            hop(steps, "agent -> gateway -> mcp", "AMP",
+                "ALLOW" if d["allowed"] else "DENY",
+                f"{conf}: {d['reason']}", decided_by=d["by"],
+                http_status=d["status"], endpoint=gw)
+            return {"trace_id": trace_id,
+                    "status": "ok" if d["allowed"] else "denied",
+                    "agent": AGENT_ID, "user": user, "steps": steps}
+
+        if req.intent != "pay":
+            return {"trace_id": trace_id, "status": "ok", "agent": AGENT_ID,
+                    "user": user, "steps": steps}
+
+        # ---- hop 4: on-behalf-of exchange --------------------------------
+        want = req.request_scopes or [CONFIDENTIAL_SCOPE]
+        want = [s for s in want if s]
+        chain = [user.get("username", "user"), AGENT_ID, PAYMENTS_AGENT]
+        try:
+            assertion = obo.issue(
+                actor=AGENT_ID, subject=user.get("username", "user"),
+                audience=PAYMENTS_AGENT, scope=want, delegation_chain=chain,
+                trace_id=trace_id, ttl_seconds=req.obo_ttl,
+                # Deliberately NOT actor_scopes=my_scopes: the concierge is
+                # supposed to be able to ask the payments agent for something
+                # it cannot do itself -- that is delegation, not escalation.
+                # Escalation is constrained on the sub-agent path instead,
+                # where the child must stay within the parent's own grant.
+                user_sub=user.get("sub", ""), runtime=RUNTIME)
+            hop(steps, "agent -> obo exchange", "DEMO", "ALLOW",
+                f"assertion minted for {PAYMENTS_AGENT}, {req.obo_ttl}s",
+                actor=AGENT_ID, token=obo.claims(assertion))
+        except obo.OBOError as exc:
+            hop(steps, "agent -> obo exchange", "DEMO", "DENY", str(exc),
+                actor=AGENT_ID)
+            return {"trace_id": trace_id, "status": "denied", "at": "obo",
+                    "agent": AGENT_ID, "user": user, "steps": steps}
+
+        # ---- hop 5: agent -> agent ---------------------------------------
+        base = await payments_base(client)
+        try:
+            r = await client.post(
+                f"{base}/settle",
+                json={"amount": req.amount, "payment_ref": req.payment_ref,
+                      "trace_id": trace_id},
+                headers={"Authorization": f"Bearer {assertion}"})
+            body = r.json()
+        except Exception as exc:
+            hop(steps, "agent -> agent", "DEMO", "DENY",
+                f"payments agent unreachable at {base}: {exc}")
+            return {"trace_id": trace_id, "status": "failed", "at": "agent-to-agent",
+                    "agent": AGENT_ID, "user": user, "steps": steps}
+
+        hop(steps, "agent -> agent", "DEMO",
+            "ALLOW" if r.status_code < 400 else "DENY",
+            f"POST {base}/settle -> {r.status_code}", actor=AGENT_ID,
+            peer=PAYMENTS_AGENT)
+        steps.extend(body.get("steps", []))
+        for i, s in enumerate(steps, 1):
+            s["seq"] = i
+
+    ok = body.get("status") == "ok"
+    return {"trace_id": trace_id, "status": "ok" if ok else "denied",
+            "agent": AGENT_ID, "user": user, "receipt": body.get("receipt"),
+            "delegation_chain": chain, "steps": steps}
 
 
 class SpawnRequest(BaseModel):
-    purpose: str = "summarise recent orders"
+    purpose: str = "summarise one order"
     scopes: List[str] = []
-    ttl_seconds: int = 30
+    ttl_seconds: int = 8
     trace_id: Optional[str] = None
 
 
 @app.post("/spawn")
-async def spawn(req: SpawnRequest):
-    """Ask the broker for a short-lived child identity with a subset of scopes."""
+async def spawn(req: SpawnRequest,
+                authorization: Optional[str] = Header(default=None)):
+    """Issue a short-lived child identity with a subset of this agent's scopes.
+
+    AMP v1.0.0 has no parent/child agent concept, no TTL field and no spawn
+    API, so the child credential is demo-minted. What is NOT demo-minted is the
+    ceiling: the parent's scopes come from the AgentID token AMP just issued,
+    so the child can never be given something the parent does not actually
+    hold.
+    """
     trace_id = req.trace_id or new_trace()
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(f"{BROKER_URL}/agents/{AGENT_ID}/subagents",
-                              json={"purpose": req.purpose, "scopes": req.scopes,
-                                    "ttl_seconds": req.ttl_seconds, "trace_id": trace_id})
-    return {"trace_id": trace_id, "status": r.status_code, "body": r.json()}
+    steps: List[Dict[str, Any]] = []
+    gw = mcpgw.gateway_url()
+    try:
+        parent_token = agentid.get_token(resource=gw)
+    except agentid.AgentIDError as exc:
+        return {"trace_id": trace_id, "status": "failed", "detail": str(exc)}
+
+    parent_scopes = (agentid.claims(parent_token).get("scope") or "").split()
+    hop(steps, "agent -> AMP IdP", "AMP", "ALLOW",
+        "parent scopes read from the AgentID token", actor=AGENT_ID,
+        token=token_view(parent_token))
+
+    child_id = f"{AGENT_ID}/child-{uuid.uuid4().hex[:8]}"
+    want = req.scopes or parent_scopes[:1]
+    try:
+        assertion = obo.issue(
+            actor=AGENT_ID, subject=child_id, audience=child_id,
+            scope=want, delegation_chain=[AGENT_ID, child_id],
+            trace_id=trace_id, ttl_seconds=req.ttl_seconds, kind="subagent",
+            actor_scopes=parent_scopes,      # the escalation check lives here
+            parent_agent=AGENT_ID, purpose=req.purpose, runtime=RUNTIME)
+    except obo.OBOError as exc:
+        hop(steps, "agent -> subagent issue", "DEMO", "DENY", str(exc),
+            actor=AGENT_ID, requested=want, parent_scopes=parent_scopes)
+        return {"trace_id": trace_id, "status": "denied", "reason": str(exc),
+                "parent_scopes": parent_scopes, "requested": want, "steps": steps}
+
+    hop(steps, "agent -> subagent issue", "DEMO", "ALLOW",
+        f"child identity issued, {req.ttl_seconds}s", actor=AGENT_ID,
+        token=obo.claims(assertion))
+    return {"trace_id": trace_id, "status": "ok", "subagent_id": child_id,
+            "parent": AGENT_ID, "parent_scopes": parent_scopes,
+            "scopes": want, "expires_in": req.ttl_seconds,
+            "assertion": assertion, "steps": steps}
+
+
+class ChildCallRequest(BaseModel):
+    assertion: str
+    tool: str = "get_order"
+    arguments: Dict[str, Any] = {}
+    trace_id: Optional[str] = None
+
+
+@app.post("/child-call")
+async def child_call(req: ChildCallRequest):
+    """Let a child identity act, within the scopes its assertion carries.
+
+    The child has no AgentID of its own -- AMP does not issue one -- so the
+    parent presents its own AMP token to the gateway and constrains the call to
+    the child's scopes first. The refusal below is the child's TTL and scope
+    set being enforced; the gateway independently enforces the parent's.
+    """
+    trace_id = req.trace_id or new_trace()
+    steps: List[Dict[str, Any]] = []
+    try:
+        c = obo.verify(req.assertion, audience=obo.claims(req.assertion).get("aud", ""))
+    except obo.OBOError as exc:
+        hop(steps, "subagent -> agent", "DEMO", "DENY", str(exc))
+        return {"trace_id": trace_id, "status": "denied", "reason": str(exc),
+                "steps": steps}
+
+    gw = mcpgw.gateway_url()
+    parent_token = agentid.get_token(resource=gw)
+    child_scopes = (c.get("scope") or "").split()
+    needed = os.getenv("TOOL_SCOPE_" + req.tool, "")
+    if needed and needed not in child_scopes:
+        hop(steps, "subagent -> agent", "DEMO", "DENY",
+            f"{req.tool} needs {needed}, which the child was not given",
+            child_scopes=child_scopes)
+        return {"trace_id": trace_id, "status": "denied",
+                "reason": f"{req.tool} is outside the child's grant", "steps": steps}
+
+    ctx = {"trace_id": trace_id, "actor": c.get("sub"), "runtime": RUNTIME,
+           "chain": c.get("delegation_chain", [])}
+    out = mcpgw.call_tool(parent_token, req.tool, req.arguments,
+                          trace_id=trace_id, context=ctx, url=gw)
+    d = mcpgw.decision(out)
+    hop(steps, "subagent -> gateway -> mcp", "AMP+DEMO",
+        "ALLOW" if d["allowed"] else "DENY", f"{req.tool}: {d['reason']}",
+        actor=c.get("sub"), decided_by=d["by"], http_status=d["status"],
+        result=d.get("result"))
+    return {"trace_id": trace_id, "status": "ok" if d["allowed"] else "denied",
+            "steps": steps}
 
 
 @app.get("/whoami")
 async def whoami():
-    """What this agent's real AMP identity actually permits."""
-    info = {"agent": AGENT_ID, "runtime": RUNTIME,
-            "agentid_configured": agentid.configured(),
-            "scopes_from_amp": agentid.granted_scopes(),
-            "mcp_gateway_url": _gateway_url() or None,
-            "mcp_gateway_usable": _gateway_usable(_gateway_url()),
-            "mcp_endpoint_in_use": mcp_url(),
-            "via_amp_gateway": mcp_url() == _gateway_url() and bool(_gateway_url())}
-    if agentid.configured():
+    """What this agent's real AMP identity permits, and where it calls."""
+    gw = mcpgw.gateway_url()
+    info: Dict[str, Any] = {
+        "agent": AGENT_ID, "runtime": RUNTIME,
+        "agentid_configured": agentid.configured(),
+        "scopes_requested": agentid.granted_scopes(),
+        "mcp_gateway_url": gw or None,
+        "calls_mcp_directly": False,
+        "payments_agent": {"name": PAYMENTS_AGENT,
+                           "internal": PAYMENTS_INTERNAL, "published": PAYMENTS_URL},
+    }
+    if agentid.configured() and gw:
         try:
-            import base64, json
-            p = mcp_token().split(".")[1]
-            p += "=" * (-len(p) % 4)
-            c = json.loads(base64.urlsafe_b64decode(p))
-            info["token_claims"] = {k: c.get(k) for k in ("sub", "scope", "aud", "iss", "exp")}
+            info["token_claims"] = token_view(agentid.get_token(resource=gw))
         except Exception as exc:
             info["token_error"] = str(exc)
     return info
