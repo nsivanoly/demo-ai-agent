@@ -38,6 +38,7 @@ from pydantic import BaseModel
 import agentid
 import mcpgw
 import obo
+import tracing
 import userauth
 
 app = FastAPI(title="Concierge Agent", version="2.0.0")
@@ -122,6 +123,7 @@ class TaskRequest(BaseModel):
 
 
 @app.post("/task")
+@tracing.agent_entry("concierge_task", agent=AGENT_ID, runtime=RUNTIME)
 async def task(req: TaskRequest,
                authorization: Optional[str] = Header(default=None)):
     """User -> this agent -> payments agent -> gateway -> MCP."""
@@ -131,6 +133,7 @@ async def task(req: TaskRequest,
 
     # ---- hop 1: the user ------------------------------------------------
     bearer = (authorization or "")[7:] if (authorization or "").lower().startswith("bearer ") else ""
+    tracing.set_attributes(trace_id=trace_id, agent=AGENT_ID, runtime=RUNTIME)
     if not bearer:
         if REQUIRE_USER_TOKEN:
             hop(steps, "user -> agent", "USER", "DENY",
@@ -141,57 +144,81 @@ async def task(req: TaskRequest,
         hop(steps, "user -> agent", "USER", "ALLOW",
             "running without a user token (REQUIRE_USER_TOKEN=false)")
     else:
-        try:
-            userauth.verify(bearer, issuer=os.getenv("USER_TOKEN_ISSUER") or None)
-            user = userauth.identity(bearer)
-            hop(steps, "user -> agent", "USER", "ALLOW",
-                f"user token verified against {user['issuer']}/oauth2/jwks",
-                actor=user["username"], token=userauth.identity(bearer))
-        except userauth.UserAuthError as exc:
-            user = userauth.identity(bearer)
-            hop(steps, "user -> agent", "USER", "DENY", str(exc),
-                actor=user.get("username"))
-            return {"trace_id": trace_id, "status": "denied", "at": "user",
-                    "steps": steps}
+        async with tracing.hop("verify_user_token", trace_id=trace_id):
+            try:
+                userauth.verify(bearer, issuer=os.getenv("USER_TOKEN_ISSUER") or None)
+                user = userauth.identity(bearer)
+                hop(steps, "user -> agent", "USER", "ALLOW",
+                    f"user token verified against {user['issuer']}/oauth2/jwks",
+                    actor=user["username"], token=userauth.identity(bearer))
+                tracing.record_decision("ALLOW", "agent",
+                                        "user token signature verified",
+                                        user=user["username"],
+                                        issuer=user["issuer"])
+            except userauth.UserAuthError as exc:
+                user = userauth.identity(bearer)
+                hop(steps, "user -> agent", "USER", "DENY", str(exc),
+                    actor=user.get("username"))
+                tracing.record_decision("DENY", "agent", str(exc))
+                return {"trace_id": trace_id, "status": "denied", "at": "user",
+                        "steps": steps}
 
     # ---- hop 2: this agent's own AMP identity ---------------------------
-    try:
-        token = agentid.get_token(resource=mcpgw.gateway_resource())
-    except agentid.AgentIDError as exc:
-        hop(steps, "agent -> AMP IdP", "AMP", "DENY", str(exc))
-        return {"trace_id": trace_id, "status": "failed", "at": "agentid",
-                "steps": steps}
-    my_scopes = (agentid.claims(token).get("scope") or "").split()
-    hop(steps, "agent -> AMP IdP", "AMP", "ALLOW",
-        "client_credentials; AMP filtered the scopes against assigned roles",
-        actor=AGENT_ID, token=token_view(token))
+    async with tracing.hop("mint_agentid_token", trace_id=trace_id):
+        try:
+            token = agentid.get_token(resource=mcpgw.gateway_resource())
+        except agentid.AgentIDError as exc:
+            hop(steps, "agent -> AMP IdP", "AMP", "DENY", str(exc))
+            tracing.record_decision("DENY", "amp-idp", str(exc))
+            return {"trace_id": trace_id, "status": "failed", "at": "agentid",
+                    "steps": steps}
+        my_scopes = (agentid.claims(token).get("scope") or "").split()
+        hop(steps, "agent -> AMP IdP", "AMP", "ALLOW",
+            "client_credentials; AMP filtered the scopes against assigned roles",
+            actor=AGENT_ID, token=token_view(token))
+        tracing.record_decision("ALLOW", "amp-idp",
+                                "scopes filtered against assigned roles",
+                                granted_scopes=my_scopes,
+                                resource=mcpgw.gateway_resource())
 
     async with httpx.AsyncClient(timeout=60) as client:
         ctx = {"trace_id": trace_id, "actor": AGENT_ID, "runtime": RUNTIME,
                "user": user.get("username"), "chain": [user.get("username"), AGENT_ID]}
 
         # ---- hop 3: work this agent is entitled to do itself -------------
-        out = mcpgw.call_tool(token, LOW_TOOL, {"order_id": req.order_id},
-                              trace_id=trace_id, context=ctx, url=gw)
-        d = mcpgw.decision(out)
-        hop(steps, "agent -> gateway -> mcp", "AMP",
-            "ALLOW" if d["allowed"] else "DENY",
-            f"{LOW_TOOL}: {d['reason']}", decided_by=d["by"],
-            http_status=d["status"], result=d.get("result"), endpoint=gw)
+        async with tracing.tool_call(LOW_TOOL, trace_id=trace_id, tool=LOW_TOOL,
+                                     endpoint=gw, actor=AGENT_ID):
+            out = mcpgw.call_tool(token, LOW_TOOL, {"order_id": req.order_id},
+                                  trace_id=trace_id, context=ctx, url=gw)
+            d = mcpgw.decision(out)
+            hop(steps, "agent -> gateway -> mcp", "AMP",
+                "ALLOW" if d["allowed"] else "DENY",
+                f"{LOW_TOOL}: {d['reason']}", decided_by=d["by"],
+                http_status=d["status"], result=d.get("result"), endpoint=gw)
+            tracing.record_decision("ALLOW" if d["allowed"] else "DENY",
+                                    d["by"], d["reason"],
+                                    http_status=d["status"])
 
         if req.skip_delegation:
             # Deliberately attempt the confidential tool with this agent's own
             # token. The gateway is what refuses it.
             conf = os.getenv("CONFIDENTIAL_TOOL", "charge_card")
-            out = mcpgw.call_tool(token, conf,
-                                  {"payment_ref": req.payment_ref,
-                                   "amount": req.amount},
-                                  trace_id=trace_id, context=ctx, url=gw)
-            d = mcpgw.decision(out)
-            hop(steps, "agent -> gateway -> mcp", "AMP",
-                "ALLOW" if d["allowed"] else "DENY",
-                f"{conf}: {d['reason']}", decided_by=d["by"],
-                http_status=d["status"], endpoint=gw)
+            async with tracing.tool_call(conf, trace_id=trace_id, tool=conf,
+                                         endpoint=gw, actor=AGENT_ID,
+                                         note="attempted without delegation"):
+                out = mcpgw.call_tool(token, conf,
+                                      {"payment_ref": req.payment_ref,
+                                       "amount": req.amount},
+                                      trace_id=trace_id, context=ctx, url=gw)
+                d = mcpgw.decision(out)
+                hop(steps, "agent -> gateway -> mcp", "AMP",
+                    "ALLOW" if d["allowed"] else "DENY",
+                    f"{conf}: {d['reason']}", decided_by=d["by"],
+                    http_status=d["status"], endpoint=gw)
+                tracing.record_decision("ALLOW" if d["allowed"] else "DENY",
+                                        d["by"], d["reason"],
+                                        http_status=d["status"],
+                                        scope_required=CONFIDENTIAL_SCOPE)
             return {"trace_id": trace_id,
                     "status": "ok" if d["allowed"] else "denied",
                     "agent": AGENT_ID, "user": user, "steps": steps}
@@ -204,7 +231,9 @@ async def task(req: TaskRequest,
         want = req.request_scopes or [CONFIDENTIAL_SCOPE]
         want = [s for s in want if s]
         chain = [user.get("username", "user"), AGENT_ID, PAYMENTS_AGENT]
-        try:
+        async with tracing.hop("obo_exchange", trace_id=trace_id,
+                               audience=PAYMENTS_AGENT, requested_scope=want):
+          try:
             assertion = obo.issue(
                 actor=AGENT_ID, subject=user.get("username", "user"),
                 audience=PAYMENTS_AGENT, scope=want, delegation_chain=chain,
@@ -218,31 +247,44 @@ async def task(req: TaskRequest,
             hop(steps, "agent -> obo exchange", "DEMO", "ALLOW",
                 f"assertion minted for {PAYMENTS_AGENT}, {req.obo_ttl}s",
                 actor=AGENT_ID, token=obo.claims(assertion))
-        except obo.OBOError as exc:
+            tracing.record_decision("ALLOW", "agent",
+                                    f"on-behalf-of assertion for {PAYMENTS_AGENT}",
+                                    delegation_chain=chain, ttl_seconds=req.obo_ttl,
+                                    credential_kind="DEMO")
+          except obo.OBOError as exc:
             hop(steps, "agent -> obo exchange", "DEMO", "DENY", str(exc),
                 actor=AGENT_ID)
+            tracing.record_decision("DENY", "agent", str(exc))
             return {"trace_id": trace_id, "status": "denied", "at": "obo",
                     "agent": AGENT_ID, "user": user, "steps": steps}
 
         # ---- hop 5: agent -> agent ---------------------------------------
         base = await payments_base(client)
-        try:
+        async with tracing.hop("call_payments_agent", trace_id=trace_id,
+                               peer=PAYMENTS_AGENT, endpoint=base):
+          try:
             r = await client.post(
                 f"{base}/settle",
                 json={"amount": req.amount, "payment_ref": req.payment_ref,
                       "trace_id": trace_id},
                 headers={"Authorization": f"Bearer {assertion}"})
             body = r.json()
-        except Exception as exc:
+          except Exception as exc:
             hop(steps, "agent -> agent", "DEMO", "DENY",
                 f"payments agent unreachable at {base}: {exc}")
+            tracing.record_decision("DENY", "agent",
+                                    f"payments agent unreachable: {exc}")
             return {"trace_id": trace_id, "status": "failed", "at": "agent-to-agent",
                     "agent": AGENT_ID, "user": user, "steps": steps}
 
-        hop(steps, "agent -> agent", "DEMO",
-            "ALLOW" if r.status_code < 400 else "DENY",
-            f"POST {base}/settle -> {r.status_code}", actor=AGENT_ID,
-            peer=PAYMENTS_AGENT)
+          hop(steps, "agent -> agent", "DEMO",
+              "ALLOW" if r.status_code < 400 else "DENY",
+              f"POST {base}/settle -> {r.status_code}", actor=AGENT_ID,
+              peer=PAYMENTS_AGENT)
+          tracing.record_decision("ALLOW" if r.status_code < 400 else "DENY",
+                                  "payments-agent",
+                                  f"settle -> HTTP {r.status_code}",
+                                  http_status=r.status_code)
         steps.extend(body.get("steps", []))
         for i, s in enumerate(steps, 1):
             s["seq"] = i
@@ -367,6 +409,7 @@ async def whoami():
         "scopes_requested": agentid.granted_scopes(),
         "mcp_gateway": mcpgw.endpoints(),
         "calls_mcp_directly": False,
+        "tracing": tracing.status(),
         "payments_agent": {"name": PAYMENTS_AGENT,
                            "candidates": PAYMENTS_CANDIDATES,
                            "published": PAYMENTS_URL},
