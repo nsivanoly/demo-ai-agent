@@ -29,10 +29,35 @@ app = FastAPI(title="Concierge Agent", version="1.0.0")
 AGENT_ID = os.getenv("AGENT_NAME", "concierge-agent")
 RUNTIME = os.getenv("AGENT_RUNTIME", "runtime-a")
 MCP_URL = os.getenv("MCP_URL", "http://host.k3d.internal:8892/mcp")
+# resolved lazily so the AMP-injected gateway URL is preferred when usable
 BROKER_URL = os.getenv("BROKER_URL", "http://host.k3d.internal:8890")
 PAYMENTS_URL = os.getenv("PAYMENTS_AGENT_URL", "http://host.k3d.internal:8894")
 LOW_TOOL = os.getenv("LOW_TOOL", "process_order")
 CONFIDENTIAL_SCOPE = os.getenv("CONFIDENTIAL_SCOPE", "")
+
+
+def mcp_url() -> str:
+    """Where to send tool calls.
+
+    When an MCP proxy is attached to the agent, AMP injects the gateway URL as
+    <MCP-CONFIG-NAME>_MCP_CONFIG_URL. Prefer it, so that the moment the proxy
+    reconciles onto the gateway the traffic flows through AMP with no code
+    change. Until then the gateway returns 404 for MCP proxies on this build,
+    so fall back to calling the enforcement point directly.
+    """
+    injected = next((v for k, v in os.environ.items()
+                     if k.endswith("_MCP_CONFIG_URL") and v), "")
+    direct = os.getenv("MCP_URL", "http://host.k3d.internal:8892/mcp")
+    if not injected:
+        return direct
+    try:
+        r = httpx.post(injected, json={"jsonrpc": "2.0", "id": 0,
+                                       "method": "tools/list"}, timeout=5)
+        if r.status_code < 400:
+            return injected
+    except Exception:
+        pass
+    return direct
 
 
 def new_trace() -> str:
@@ -41,7 +66,7 @@ def new_trace() -> str:
 
 async def call_tool(client: httpx.AsyncClient, token: str, trace_id: str,
                     tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
-    r = await client.post(MCP_URL,
+    r = await client.post(mcp_url(),
                           json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                                 "params": {"name": tool, "arguments": args}},
                           headers={"Authorization": f"Bearer {token}",
