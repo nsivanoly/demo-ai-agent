@@ -30,6 +30,7 @@ from pydantic import BaseModel
 import agentid
 import mcpgw
 import obo
+import tracing
 
 app = FastAPI(title="Payments Agent", version="2.0.0")
 
@@ -63,11 +64,13 @@ class SettleRequest(BaseModel):
 
 
 @app.post("/settle")
+@tracing.agent_entry("payments_settle", agent=AGENT_ID, runtime=RUNTIME)
 async def settle(req: SettleRequest,
                  authorization: Optional[str] = Header(default=None)):
     """Act under a verified on-behalf-of assertion, on a vault reference only."""
     trace_id = req.trace_id or ("txn-" + uuid.uuid4().hex[:16])
     steps: List[Dict[str, Any]] = []
+    tracing.set_attributes(trace_id=trace_id, agent=AGENT_ID, runtime=RUNTIME)
 
     assertion = (authorization or "")[7:] if (authorization or "").lower().startswith("bearer ") else ""
     if not assertion:
@@ -76,51 +79,76 @@ async def settle(req: SettleRequest,
         return {"status": "denied", "at": "obo", "trace_id": trace_id, "steps": steps}
 
     # ---- verify the delegation ------------------------------------------
-    try:
-        c = obo.verify(assertion, audience=AGENT_ID)
-    except obo.OBOError as exc:
-        hop(steps, "agent -> obo verify", "DEMO", "DENY", str(exc),
-            actor=AGENT_ID, presented=obo.claims(assertion).get("act"))
-        return {"status": "denied", "at": "obo", "trace_id": trace_id,
-                "reason": str(exc), "steps": steps}
+    async with tracing.hop("verify_obo_assertion", trace_id=trace_id,
+                           audience=AGENT_ID):
+        try:
+            c = obo.verify(assertion, audience=AGENT_ID)
+        except obo.OBOError as exc:
+            hop(steps, "agent -> obo verify", "DEMO", "DENY", str(exc),
+                actor=AGENT_ID, presented=obo.claims(assertion).get("act"))
+            tracing.record_decision("DENY", "agent", str(exc))
+            return {"status": "denied", "at": "obo", "trace_id": trace_id,
+                    "reason": str(exc), "steps": steps}
 
-    delegator = (c.get("act") or {}).get("sub", "")
-    if delegator not in TRUSTED_DELEGATORS:
-        hop(steps, "agent -> obo verify", "DEMO", "DENY",
-            f"'{delegator}' is not in this agent's trusted delegators",
-            actor=AGENT_ID, trusted=TRUSTED_DELEGATORS)
-        return {"status": "denied", "at": "obo", "trace_id": trace_id,
-                "reason": f"delegation from '{delegator}' is not accepted",
-                "steps": steps}
+        delegator = (c.get("act") or {}).get("sub", "")
+        if delegator not in TRUSTED_DELEGATORS:
+            hop(steps, "agent -> obo verify", "DEMO", "DENY",
+                f"'{delegator}' is not in this agent's trusted delegators",
+                actor=AGENT_ID, trusted=TRUSTED_DELEGATORS)
+            tracing.record_decision(
+                "DENY", "agent",
+                f"delegation from '{delegator}' is not accepted",
+                delegator=delegator, trusted_delegators=TRUSTED_DELEGATORS)
+            return {"status": "denied", "at": "obo", "trace_id": trace_id,
+                    "reason": f"delegation from '{delegator}' is not accepted",
+                    "steps": steps}
 
-    hop(steps, "agent -> obo verify", "DEMO", "ALLOW",
-        f"assertion from {delegator} on behalf of {c.get('sub')}",
-        actor=AGENT_ID, token=c)
+        hop(steps, "agent -> obo verify", "DEMO", "ALLOW",
+            f"assertion from {delegator} on behalf of {c.get('sub')}",
+            actor=AGENT_ID, token=c)
+        tracing.record_decision("ALLOW", "agent",
+                                f"assertion from {delegator}",
+                                delegator=delegator, acting_for=c.get("sub"),
+                                delegation_chain=c.get("delegation_chain", []),
+                                credential_kind="DEMO")
 
     # ---- this agent's OWN AMP identity ----------------------------------
     gw = mcpgw.gateway_url()
-    try:
-        token = agentid.get_token(resource=mcpgw.gateway_resource())
-    except agentid.AgentIDError as exc:
-        hop(steps, "agent -> AMP IdP", "AMP", "DENY", str(exc))
-        return {"status": "failed", "at": "agentid", "trace_id": trace_id,
-                "steps": steps}
-    hop(steps, "agent -> AMP IdP", "AMP", "ALLOW",
-        "own client_credentials token; the asserted scopes are not carried over",
-        actor=AGENT_ID, token=token_view(token))
+    async with tracing.hop("mint_agentid_token", trace_id=trace_id):
+        try:
+            token = agentid.get_token(resource=mcpgw.gateway_resource())
+        except agentid.AgentIDError as exc:
+            hop(steps, "agent -> AMP IdP", "AMP", "DENY", str(exc))
+            tracing.record_decision("DENY", "amp-idp", str(exc))
+            return {"status": "failed", "at": "agentid", "trace_id": trace_id,
+                    "steps": steps}
+        hop(steps, "agent -> AMP IdP", "AMP", "ALLOW",
+            "own client_credentials token; the asserted scopes are not carried over",
+            actor=AGENT_ID, token=token_view(token))
+        tracing.record_decision(
+            "ALLOW", "amp-idp",
+            "own token; asserted scopes are not carried over",
+            granted_scopes=(agentid.claims(token).get("scope") or "").split())
 
     # ---- the confidential call, through the gateway ----------------------
     ctx = {"trace_id": trace_id, "actor": AGENT_ID, "runtime": RUNTIME,
            "user": c.get("sub"), "chain": c.get("delegation_chain", [])}
-    out = mcpgw.call_tool(token, CONFIDENTIAL_TOOL,
-                          {"payment_ref": req.payment_ref, "amount": req.amount},
-                          trace_id=trace_id, context=ctx, url=gw)
-    d = mcpgw.decision(out)
-    hop(steps, "agent -> gateway -> mcp", "AMP",
-        "ALLOW" if d["allowed"] else "DENY",
-        f"{CONFIDENTIAL_TOOL}: {d['reason']}", actor=AGENT_ID,
-        decided_by=d["by"], http_status=d["status"], endpoint=gw,
-        result=d.get("result"))
+    async with tracing.tool_call(CONFIDENTIAL_TOOL, trace_id=trace_id,
+                                 tool=CONFIDENTIAL_TOOL, endpoint=gw,
+                                 actor=AGENT_ID,
+                                 payment_ref=req.payment_ref):
+        out = mcpgw.call_tool(token, CONFIDENTIAL_TOOL,
+                              {"payment_ref": req.payment_ref, "amount": req.amount},
+                              trace_id=trace_id, context=ctx, url=gw)
+        d = mcpgw.decision(out)
+        hop(steps, "agent -> gateway -> mcp", "AMP",
+            "ALLOW" if d["allowed"] else "DENY",
+            f"{CONFIDENTIAL_TOOL}: {d['reason']}", actor=AGENT_ID,
+            decided_by=d["by"], http_status=d["status"], endpoint=gw,
+            result=d.get("result"))
+        tracing.record_decision("ALLOW" if d["allowed"] else "DENY",
+                                d["by"], d["reason"],
+                                http_status=d["status"])
 
     receipt = d.get("result") if d["allowed"] else None
     return {"status": "ok" if d["allowed"] else "denied",
@@ -142,6 +170,7 @@ async def whoami():
         "mcp_gateway": mcpgw.endpoints(),
         "calls_mcp_directly": False,
         "trusted_delegators": TRUSTED_DELEGATORS,
+        "tracing": tracing.status(),
     }
     if agentid.configured() and gw:
         try:
