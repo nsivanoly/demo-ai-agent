@@ -21,6 +21,17 @@ only through a delegated credential from the concierge agent, and it never sees
 a card number: it passes an opaque vault reference (`tok_...`) to the tool and
 the vault de-tokenises internally, returning a masked receipt.
 
+## How it reaches the MCP server
+
+AMP attaches the MCP proxy to this agent and injects the gateway URL as
+`<config-name>_MCP_CONFIG_URL`. `mcp_url()` prefers that, so the moment the
+proxy reconciles onto the gateway the traffic flows through AMP with no code
+change. On the current build the gateway returns 404 for MCP proxies, so it
+falls back to `MCP_URL` — the enforcement point directly.
+
+Either way the authorization is identical: the agent presents its real AgentID
+token and the enforcement point checks the scopes AMP put in it.
+
 ## Endpoints
 
 ```
