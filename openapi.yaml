@@ -1,0 +1,116 @@
+openapi: 3.1.0
+info:
+  title: Payments Agent
+  version: 1.0.0
+  description: Agent API for the WSO2 Agent Manager identity and trust demo. The agent authenticates with
+    a real AgentID token whose scopes AMP filters against its assigned roles.
+paths:
+  /settle:
+    post:
+      summary: Settle
+      description: Act under the delegated credential, on a vault reference only.
+      operationId: settle_settle_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SettleRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /whoami:
+    get:
+      summary: Whoami
+      operationId: whoami_whoami_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+  /health:
+    get:
+      summary: Health
+      operationId: health_health_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+components:
+  schemas:
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          type: array
+          title: Detail
+      type: object
+      title: HTTPValidationError
+    SettleRequest:
+      properties:
+        delegated_token:
+          type: string
+          title: Delegated Token
+        amount:
+          type: number
+          title: Amount
+        payment_ref:
+          type: string
+          title: Payment Ref
+          default: tok_card_9931
+        user:
+          type: string
+          title: User
+          default: alice@example.com
+        trace_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Trace Id
+      type: object
+      required:
+      - delegated_token
+      - amount
+      title: SettleRequest
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          type: array
+          title: Location
+        msg:
+          type: string
+          title: Message
+        type:
+          type: string
+          title: Error Type
+        input:
+          title: Input
+        ctx:
+          type: object
+          title: Context
+      type: object
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError
+servers:
+- url: /
+  description: Agent base path
