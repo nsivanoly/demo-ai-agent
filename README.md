@@ -30,6 +30,17 @@ agent.** Remove a role in the Console and the scope is gone from the next token.
 This agent deliberately holds only low-sensitivity scopes. Anything higher is
 delegated to the payments agent.
 
+## How it reaches the MCP server
+
+AMP attaches the MCP proxy to this agent and injects the gateway URL as
+`<config-name>_MCP_CONFIG_URL`. `mcp_url()` prefers that, so the moment the
+proxy reconciles onto the gateway the traffic flows through AMP with no code
+change. On the current build the gateway returns 404 for MCP proxies, so it
+falls back to `MCP_URL` — the enforcement point directly.
+
+Either way the authorization is identical: the agent presents its real AgentID
+token and the enforcement point checks the scopes AMP put in it.
+
 ## Endpoints
 
 ```
