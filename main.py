@@ -37,27 +37,27 @@ CONFIDENTIAL_SCOPE = os.getenv("CONFIDENTIAL_SCOPE", "")
 
 
 def mcp_url() -> str:
-    """Where to send tool calls.
+    """The MCP endpoint this agent calls.
 
-    When an MCP proxy is attached to the agent, AMP injects the gateway URL as
-    <MCP-CONFIG-NAME>_MCP_CONFIG_URL. Prefer it, so that the moment the proxy
-    reconciles onto the gateway the traffic flows through AMP with no code
-    change. Until then the gateway returns 404 for MCP proxies on this build,
-    so fall back to calling the enforcement point directly.
+    When an MCP proxy is attached, AMP injects the gateway URL for it as
+    <config-name>_MCP_CONFIG_URL. That URL is what the agent calls AND the
+    OAuth 2.0 target resource (RFC 8707) the token must be bound to, so it has
+    to be known before the token is minted, not just before the call.
+
+    MCP_URL is only a fallback for running outside AMP.
     """
     injected = next((v for k, v in os.environ.items()
                      if k.endswith("_MCP_CONFIG_URL") and v), "")
-    direct = os.getenv("MCP_URL", "http://host.k3d.internal:8892/mcp")
-    if not injected:
-        return direct
-    try:
-        r = httpx.post(injected, json={"jsonrpc": "2.0", "id": 0,
-                                       "method": "tools/list"}, timeout=5)
-        if r.status_code < 400:
-            return injected
-    except Exception:
-        pass
-    return direct
+    return injected or os.getenv("MCP_URL", "http://host.k3d.internal:8892/mcp")
+
+
+def mcp_token() -> str:
+    """An AgentID token bound to the MCP endpoint as its target resource.
+
+    The gateway authorizes the call against the scopes in this token, so the
+    resource has to be the endpoint being called.
+    """
+    return agentid.get_token(resource=mcp_url())
 
 
 def new_trace() -> str:
@@ -92,12 +92,13 @@ async def task(req: TaskRequest):
     steps: List[Dict[str, Any]] = []
 
     try:
-        token = agentid.get_token()
+        token = mcp_token()
     except agentid.AgentIDError as exc:
         return {"trace_id": trace_id, "status": "failed", "at": "agentid",
                 "detail": str(exc)}
     steps.append({"hop": "agentid", "action": "AgentID token minted",
-                  "scopes": agentid.granted_scopes(), "credential": "AMP"})
+                  "scopes": agentid.granted_scopes(), "credential": "AMP",
+                  "resource": mcp_url()})
 
     async with httpx.AsyncClient(timeout=30) as client:
         # --- work this agent is entitled to do itself --------------------
@@ -156,11 +157,14 @@ async def whoami():
     """What this agent's real AMP identity actually permits."""
     info = {"agent": AGENT_ID, "runtime": RUNTIME,
             "agentid_configured": agentid.configured(),
-            "scopes_from_amp": agentid.granted_scopes()}
+            "scopes_from_amp": agentid.granted_scopes(),
+            "mcp_endpoint": mcp_url(),
+            "mcp_endpoint_is_amp_gateway": any(
+                k.endswith("_MCP_CONFIG_URL") and v for k, v in os.environ.items())}
     if agentid.configured():
         try:
             import base64, json
-            p = agentid.get_token().split(".")[1]
+            p = mcp_token().split(".")[1]
             p += "=" * (-len(p) % 4)
             c = json.loads(base64.urlsafe_b64decode(p))
             info["token_claims"] = {k: c.get(k) for k in ("sub", "scope", "aud", "iss", "exp")}
