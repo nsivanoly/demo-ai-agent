@@ -237,9 +237,20 @@ class S(TypedDict):
     messages: Annotated[list, add_messages]
 
 
+HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "3"))
+
+
+def _window(messages: list) -> list:
+    """The last few turns only. The conversation is kept, but sending all of it (tool
+    results included) on every call grows the prompt without bound. The window starts
+    at a user message, so no tool result is ever separated from the call that made it."""
+    starts = [i for i, msg in enumerate(messages) if isinstance(msg, HumanMessage)]
+    return messages[starts[-HISTORY_TURNS]:] if len(starts) > HISTORY_TURNS else messages
+
+
 def agent_node(state: S, config) -> Dict[str, Any]:
     model = llm.chat_model().bind_tools(TOOLS)
-    msg = model.invoke([SystemMessage(SYSTEM)] + state["messages"])
+    msg = model.invoke([SystemMessage(SYSTEM)] + _window(state["messages"]))
     return {"messages": [msg]}
 
 
@@ -308,10 +319,13 @@ def _caller(forwarded: Optional[str], authorization: Optional[str]) -> str:
     return _bearer(forwarded) or _bearer(authorization)
 
 
-def _context(tid: str, token: str, txn: str) -> Dict[str, Any]:
-    c = identity.claims(token)
-    ctx = CTX.get(tid) or {"trail": audit.Trail(txn or "txn-" + uuid.uuid4().hex[:12])}
-    ctx.update(token=token, username=c.get("username") or c.get("sub"))
+def _context(tid: str, token: str, txn: str, new_turn: bool = True) -> Dict[str, Any]:
+    """Per-conversation context. Every new message starts a new transaction and hop record;
+    only a resume after consent continues the current one."""
+    ctx = CTX.get(tid) or {}
+    if new_turn or "trail" not in ctx:
+        ctx["trail"] = audit.Trail(txn or "txn-" + uuid.uuid4().hex[:12])
+    ctx.update(token=token, username=identity.citizen(token) or identity.claims(token).get("sub"))
     CTX[tid] = ctx
     return ctx
 
@@ -343,8 +357,8 @@ def chat(req: Chat, authorization: Optional[str] = Header(default=None),
          x_forwarded_authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
     tid = req.thread_id or "t-" + uuid.uuid4().hex[:10]
     c = _context(tid, _caller(x_forwarded_authorization, authorization), req.txn)
-    c["trail"].hop("user → agent", "ALLOW", f"signed in as {c['username']}", decided_by="Agent Manager agent gateway",
-                   token=identity.view(c["token"]))
+    c["trail"].hop("user → agent", "ALLOW", f"signed in as {c['username']} (from the verified subject)",
+                   decided_by="Agent Manager agent gateway", token=identity.view(c["token"]))
     cfg = {"configurable": {"thread_id": tid}, "run_name": "concierge.chat", "metadata": {"txn": c["trail"].txn}}
     return _guarded(tid, lambda: GRAPH.invoke({"messages": [HumanMessage(req.message)]}, cfg))
 
@@ -352,7 +366,7 @@ def chat(req: Chat, authorization: Optional[str] = Header(default=None),
 @app.post("/chat/resume")
 def resume(req: Resume, authorization: Optional[str] = Header(default=None),
          x_forwarded_authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
-    c = _context(req.thread_id, _caller(x_forwarded_authorization, authorization), "")
+    c = _context(req.thread_id, _caller(x_forwarded_authorization, authorization), "", new_turn=False)
     c["trail"].hop("step-up consent", "ALLOW" if req.approved else "DENY",
                    f"user token now carries {identity.scopes_of(c['token'])}", decided_by="ThunderID consent",
                    token=identity.view(c["token"]))

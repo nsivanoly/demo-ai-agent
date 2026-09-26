@@ -37,6 +37,10 @@ TOKEN_ENDPOINT = os.getenv("AMP_AGENTID_TOKEN_ENDPOINT", "")
 # AMP_AGENTID_SCOPES is computed at creation, before any role exists.
 OWN_SCOPES = (os.getenv("AGENT_ROLE_SCOPES") or os.getenv("AMP_AGENTID_SCOPES", "")).split()
 MCP_RESOURCE = os.getenv("MCP_RESOURCE", "")
+# Verified subject (sub) -> citizen record, written by setup. A record is looked up by
+# the token's subject, which the IdP always issues, never by the username claim alone:
+# that is an optional attribute the user can decline on the consent screen.
+SUBJECTS: Dict[str, str] = json.loads(os.getenv("SUBJECT_DIRECTORY", "{}") or "{}")
 
 TX = "urn:ietf:params:oauth:grant-type:token-exchange"
 AT = "urn:ietf:params:oauth:token-type:access_token"
@@ -63,6 +67,12 @@ def claims(token: str) -> Dict[str, Any]:
 
 def scopes_of(token: str) -> List[str]:
     return (claims(token).get("scope") or "").split()
+
+
+def citizen(token: str) -> str:
+    """The citizen record this token is for: by verified subject first, then the username claim."""
+    c = claims(token)
+    return SUBJECTS.get(c.get("sub", "")) or c.get("username") or ""
 
 
 def view(token: str) -> Dict[str, Any]:
