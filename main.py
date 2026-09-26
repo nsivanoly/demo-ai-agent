@@ -23,6 +23,7 @@ from fastapi import FastAPI, Header
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel
 
+import httptrace  # noqa: F401  (wraps httpx first, so every outbound call is recorded)
 import audit
 import gateway
 import identity
@@ -88,7 +89,7 @@ def delegate(s: S) -> S:
         return {"stop": True, "outcome": {"status": "denied", "reason": str(e)}}
     s["trail"].hop("token exchange (OBO)", "ALLOW" if d["granted"] else "DENY",
                    f"asked {d['requested']}, capped out {d['capped_out'] or 'nothing'}, granted {d['granted']}",
-                   decided_by="ThunderID", token=d["view"])
+                   decided_by="ThunderID", token=d["view"], actor_token=d["actor_view"])
     return {"delegated": d}
 
 
@@ -180,14 +181,15 @@ def settle(req: Settle, authorization: Optional[str] = Header(default=None),
     # X-Forwarded-Authorization (its jwt-auth default).
     raw = x_forwarded_authorization or authorization or ""
     token = raw[7:] if raw.lower().startswith("bearer ") else ""
+    calls = httptrace.start(AGENT)
     trail = audit.Trail(req.txn or "txn-" + uuid.uuid4().hex[:12])
     if not token:
         trail.hop("verify delegation", "DENY", "no token presented", decided_by=AGENT)
-        return {"status": "denied", "reason": "no token", "hops": trail.hops}
+        return {"status": "denied", "reason": "no token", "hops": trail.hops, "http": calls}
     out = GRAPH.invoke({"req": req.model_dump(), "incoming": token, "trail": trail},
                        config={"run_name": f"payments.{req.action}", "metadata": {"txn": trail.txn}})
     o = out.get("outcome") or {}
-    return {**o, "summary": out.get("summary"), "agent": AGENT, "txn": trail.txn, "hops": trail.hops}
+    return {**o, "summary": out.get("summary"), "agent": AGENT, "txn": trail.txn, "hops": trail.hops, "http": calls}
 
 
 @app.get("/whoami")
