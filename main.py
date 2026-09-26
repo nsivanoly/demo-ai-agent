@@ -253,10 +253,26 @@ def _window(messages: list) -> list:
     return messages[starts[-HISTORY_TURNS]:] if len(starts) > HISTORY_TURNS else messages
 
 
+def _tool_call_rejected(e: Exception) -> bool:
+    """Groq sometimes rejects a malformed tool call it generated itself (400
+    tool_use_failed, "Failed to call a function"). A retry usually succeeds."""
+    t = str(e)
+    return "tool_use_failed" in t or "Failed to call a function" in t
+
+
 def agent_node(state: S, config) -> Dict[str, Any]:
+    prompt = [SystemMessage(SYSTEM)] + _window(state["messages"])
     model = llm.chat_model().bind_tools(TOOLS)
-    msg = model.invoke([SystemMessage(SYSTEM)] + _window(state["messages"]))
-    return {"messages": [msg]}
+    for attempt in range(3):
+        try:
+            return {"messages": [model.invoke(prompt)]}
+        except Exception as e:
+            if not _tool_call_rejected(e):
+                raise
+    # Still failing: answer without tools rather than return nothing.
+    return {"messages": [llm.chat_model().invoke(prompt + [SystemMessage(
+        "Tool calling is unavailable for this reply. Answer briefly from the conversation, "
+        "and ask the user to repeat the request if an action is needed.")])]}
 
 
 def tools_node(state: S, config) -> Dict[str, Any]:
@@ -351,7 +367,9 @@ def _guarded(tid: str, fn) -> Dict[str, Any]:
     except Exception as e:
         verdict = llm.guardrail_verdict(e)
         if not verdict:
-            raise
+            CTX[tid]["trail"].hop("agent error", "DENY", f"{type(e).__name__}: {str(e)[:200]}", decided_by=AGENT)
+            return {"status": "error", "thread_id": tid, "txn": CTX[tid]["trail"].txn,
+                    "answer": "Sorry, something went wrong handling that. Please try again.", "hops": CTX[tid]["trail"].hops}
         CTX[tid]["trail"].hop("LLM call", "BLOCK", verdict, decided_by="Agent Manager LLM gateway")
         return {"status": "blocked", "thread_id": tid, "txn": CTX[tid]["trail"].txn, "answer": verdict,
                 "hops": CTX[tid]["trail"].hops}
