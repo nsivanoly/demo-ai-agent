@@ -36,6 +36,7 @@ from langgraph.graph.message import add_messages
 from langgraph.types import Command, interrupt
 from pydantic import BaseModel
 
+import httptrace  # noqa: F401  (wraps httpx first, so every outbound call is recorded)
 import audit
 import gateway
 import identity
@@ -91,7 +92,7 @@ def _own_call(c: Dict[str, Any], tool_name: str, args: Dict[str, Any], scopes: L
         return {"error": str(e)}
     c["trail"].hop("token exchange (OBO)", "ALLOW",
                    f"asked {scopes}, capped out {d['capped_out'] or 'nothing'}, granted {d['granted']}",
-                   decided_by="ThunderID", token=d["view"])
+                   decided_by="ThunderID", token=d["view"], actor_token=d["actor_view"])
     r = gateway.call_tool(d["token"], tool_name, args, _mcp_ctx(c))
     c["trail"].hop(tool_name, "ALLOW" if r["allowed"] else "DENY", r["reason"][:200], decided_by=r["decided_by"])
     return r["result"] if r["allowed"] else {"refused": r["reason"], "decided_by": r["decided_by"]}
@@ -107,7 +108,8 @@ def _to_payments(c: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
         c["trail"].hop("token exchange (OBO) for the payments agent", "DENY", str(e), decided_by="ThunderID")
         return {"status": "denied", "reason": str(e)}
     c["trail"].hop("token exchange (OBO) for the payments agent", "ALLOW",
-                   f"delegation for the payments agent: {d['granted']}", decided_by="ThunderID", token=d["view"])
+                   f"delegation for the payments agent: {d['granted']}", decided_by="ThunderID", token=d["view"],
+                   actor_token=d["actor_view"])
     try:
         hdrs = {"Authorization": f"Bearer {d['token']}", "User-Agent": identity.UA}
         if AGENT_GATEWAY_HOST:
@@ -119,7 +121,10 @@ def _to_payments(c: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
         c["trail"].hop("call payments agent", "DENY", f"payments agent unreachable: {e}", decided_by="network")
         return {"status": "failed", "reason": str(e)}
     c["trail"].hops.extend(out.get("hops") or [])
-    return {k: v for k, v in out.items() if k != "hops"}
+    calls = httptrace._active.get()
+    if calls is not None:
+        calls.extend(out.get("http") or [])          # the payments agent's own outbound calls
+    return {k: v for k, v in out.items() if k not in ("hops", "http")}
 
 
 def _child(c: Dict[str, Any], application_id: str, scopes: List[str], try_tools: List[str]) -> Dict[str, Any]:
@@ -355,23 +360,29 @@ def _guarded(tid: str, fn) -> Dict[str, Any]:
 @app.post("/chat")
 def chat(req: Chat, authorization: Optional[str] = Header(default=None),
          x_forwarded_authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    calls = httptrace.start(AGENT)
     tid = req.thread_id or "t-" + uuid.uuid4().hex[:10]
     c = _context(tid, _caller(x_forwarded_authorization, authorization), req.txn)
     c["trail"].hop("user → agent", "ALLOW", f"signed in as {c['username']} (from the verified subject)",
                    decided_by="Agent Manager agent gateway", token=identity.view(c["token"]))
     cfg = {"configurable": {"thread_id": tid}, "run_name": "concierge.chat", "metadata": {"txn": c["trail"].txn}}
-    return _guarded(tid, lambda: GRAPH.invoke({"messages": [HumanMessage(req.message)]}, cfg))
+    out = _guarded(tid, lambda: GRAPH.invoke({"messages": [HumanMessage(req.message)]}, cfg))
+    out["http"] = calls
+    return out
 
 
 @app.post("/chat/resume")
 def resume(req: Resume, authorization: Optional[str] = Header(default=None),
          x_forwarded_authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    calls = httptrace.start(AGENT)
     c = _context(req.thread_id, _caller(x_forwarded_authorization, authorization), "", new_turn=False)
     c["trail"].hop("step-up consent", "ALLOW" if req.approved else "DENY",
                    f"user token now carries {identity.scopes_of(c['token'])}", decided_by="ThunderID consent",
                    token=identity.view(c["token"]))
     cfg = {"configurable": {"thread_id": req.thread_id}, "run_name": "concierge.resume"}
-    return _guarded(req.thread_id, lambda: GRAPH.invoke(Command(resume={"approved": req.approved}), cfg))
+    out = _guarded(req.thread_id, lambda: GRAPH.invoke(Command(resume={"approved": req.approved}), cfg))
+    out["http"] = calls
+    return out
 
 
 # --- deterministic paths for the headless scenario checks -------------------
@@ -393,6 +404,7 @@ def _scenario_ctx(token: str, txn: str) -> Dict[str, Any]:
 @app.post("/scenario/{name}")
 def scenario(name: str, req: Scenario, authorization: Optional[str] = Header(default=None),
          x_forwarded_authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    calls = httptrace.start(AGENT)
     c = _scenario_ctx(_caller(x_forwarded_authorization, authorization), req.txn)
     c["trail"].hop("user → agent", "ALLOW", f"signed in as {c['username']}", decided_by="Agent Manager agent gateway",
                    token=identity.view(c["token"]))
@@ -415,7 +427,7 @@ def scenario(name: str, req: Scenario, authorization: Optional[str] = Header(def
         out = {"allowed": r["allowed"], "status": r["status"]}
     else:
         out = {"error": f"unknown scenario {name}"}
-    return {"scenario": name, "result": out, "txn": c["trail"].txn, "hops": c["trail"].hops}
+    return {"scenario": name, "result": out, "txn": c["trail"].txn, "hops": c["trail"].hops, "http": calls}
 
 
 @app.get("/whoami")

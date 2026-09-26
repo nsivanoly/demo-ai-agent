@@ -142,8 +142,10 @@ def delegate(subject_token: str, scopes: List[str], resource: str = "", apply_ca
     within, beyond = cap(scopes) if apply_cap else (scopes, [])
     if not within:
         raise IdentityError(f"nothing to request: {beyond} are outside this agent's own grant {OWN_SCOPES}")
+    actor = own_token()
     body = _post({"grant_type": TX, "subject_token": subject_token, "subject_token_type": AT,
-                  "actor_token": own_token(), "actor_token_type": AT,
+                  "actor_token": actor, "actor_token_type": AT,
                   "resource": resource, "scope": " ".join(within)})
     tok = body["access_token"]
-    return {"token": tok, "requested": scopes, "capped_out": beyond, "granted": scopes_of(tok), "view": view(tok)}
+    return {"token": tok, "requested": scopes, "capped_out": beyond, "granted": scopes_of(tok), "view": view(tok),
+            "actor_view": view(actor), "subject_view": view(subject_token)}
