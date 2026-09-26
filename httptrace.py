@@ -83,20 +83,24 @@ def _clip(o: Any) -> Any:
     return s[:BODY_LIMIT] + "…"
 
 
-def _headers(h: httpx.Headers) -> List[List[str]]:
+def _headers(h: Any) -> List[List[str]]:
     return [[k, _mask_value(v) if k.lower() in SECRET_HEADERS else v] for k, v in h.items()]
 
 
-_orig_send = httpx.Client.send
+def _wrap(orig):
+    """A send() that records the call, for any httpx-compatible client class."""
+    def send(self, request, *a: Any, **k: Any):
+        return _record(orig, self, request, *a, **k)
+    return send
 
 
-def _send(self: httpx.Client, request: httpx.Request, *a: Any, **k: Any) -> httpx.Response:
+def _record(orig, self, request, *a: Any, **k: Any):
     calls = _active.get()
     if calls is None:
-        return _orig_send(self, request, *a, **k)
+        return orig(self, request, *a, **k)
     t0 = time.time()
     try:
-        response = _orig_send(self, request, *a, **k)
+        response = orig(self, request, *a, **k)
     except Exception as e:
         calls.append({"agent": AGENT, "method": request.method, "url": str(request.url), "status": 0,
                       "reason": type(e).__name__, "duration_ms": int((time.time() - t0) * 1000), "ts": int(t0),
@@ -117,4 +121,11 @@ def _send(self: httpx.Client, request: httpx.Request, *a: Any, **k: Any) -> http
     return response
 
 
-httpx.Client.send = _send   # installed on import
+# Installed on import. The OpenAI SDK (used for the LLM) ships its own copy of httpx as
+# "httpx2", so both are wrapped, or the model calls would be missing.
+httpx.Client.send = _wrap(httpx.Client.send)
+try:
+    import httpx2
+    httpx2.Client.send = _wrap(httpx2.Client.send)
+except ImportError:
+    pass
