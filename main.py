@@ -294,6 +294,13 @@ def _bearer(h: Optional[str]) -> str:
     return h[7:] if (h or "").lower().startswith("bearer ") else ""
 
 
+def _caller(forwarded: Optional[str], authorization: Optional[str]) -> str:
+    """The caller's token. The agent gateway validates it and forwards it as
+    X-Forwarded-Authorization (its jwt-auth default); Authorization is the fallback
+    for a call that did not come through the gateway."""
+    return _bearer(forwarded) or _bearer(authorization)
+
+
 def _context(tid: str, token: str, txn: str) -> Dict[str, Any]:
     c = identity.claims(token)
     ctx = CTX.get(tid) or {"trail": audit.Trail(txn or "txn-" + uuid.uuid4().hex[:12])}
@@ -325,9 +332,10 @@ def _guarded(tid: str, fn) -> Dict[str, Any]:
 
 
 @app.post("/chat")
-def chat(req: Chat, authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+def chat(req: Chat, authorization: Optional[str] = Header(default=None),
+         x_forwarded_authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
     tid = req.thread_id or "t-" + uuid.uuid4().hex[:10]
-    c = _context(tid, _bearer(authorization), req.txn)
+    c = _context(tid, _caller(x_forwarded_authorization, authorization), req.txn)
     c["trail"].hop("user → agent", "ALLOW", f"signed in as {c['username']}", decided_by="Agent Manager agent gateway",
                    token=identity.view(c["token"]))
     cfg = {"configurable": {"thread_id": tid}, "run_name": "concierge.chat", "metadata": {"txn": c["trail"].txn}}
@@ -335,8 +343,9 @@ def chat(req: Chat, authorization: Optional[str] = Header(default=None)) -> Dict
 
 
 @app.post("/chat/resume")
-def resume(req: Resume, authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
-    c = _context(req.thread_id, _bearer(authorization), "")
+def resume(req: Resume, authorization: Optional[str] = Header(default=None),
+         x_forwarded_authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    c = _context(req.thread_id, _caller(x_forwarded_authorization, authorization), "")
     c["trail"].hop("step-up consent", "ALLOW" if req.approved else "DENY",
                    f"user token now carries {identity.scopes_of(c['token'])}", decided_by="ThunderID consent",
                    token=identity.view(c["token"]))
@@ -361,8 +370,9 @@ def _scenario_ctx(token: str, txn: str) -> Dict[str, Any]:
 
 
 @app.post("/scenario/{name}")
-def scenario(name: str, req: Scenario, authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
-    c = _scenario_ctx(_bearer(authorization), req.txn)
+def scenario(name: str, req: Scenario, authorization: Optional[str] = Header(default=None),
+         x_forwarded_authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    c = _scenario_ctx(_caller(x_forwarded_authorization, authorization), req.txn)
     c["trail"].hop("user → agent", "ALLOW", f"signed in as {c['username']}", decided_by="Agent Manager agent gateway",
                    token=identity.view(c["token"]))
     if name == "read":
