@@ -174,8 +174,12 @@ GRAPH = g.compile()
 
 
 @app.post("/settle")
-def settle(req: Settle, authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
-    token = (authorization or "")[7:] if (authorization or "").lower().startswith("bearer ") else ""
+def settle(req: Settle, authorization: Optional[str] = Header(default=None),
+           x_forwarded_authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    # The agent gateway validates the caller's token and forwards it as
+    # X-Forwarded-Authorization (its jwt-auth default).
+    raw = x_forwarded_authorization or authorization or ""
+    token = raw[7:] if raw.lower().startswith("bearer ") else ""
     trail = audit.Trail(req.txn or "txn-" + uuid.uuid4().hex[:12])
     if not token:
         trail.hop("verify delegation", "DENY", "no token presented", decided_by=AGENT)
