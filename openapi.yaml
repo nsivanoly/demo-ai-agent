@@ -1,0 +1,20 @@
+openapi: 3.0.3
+info: {title: Concierge Agent, version: "3.0"}
+paths:
+  /chat:
+    post:
+      summary: Talk to the concierge on the signed-in user's behalf
+      requestBody: {content: {application/json: {schema: {type: object, properties: {message: {type: string}, thread_id: {type: string}, txn: {type: string}}}}}}
+      responses: {"200": {description: Answer, or consent_required with the scopes to step up}}
+  /chat/resume:
+    post:
+      summary: Resume a paused conversation after step-up consent
+      requestBody: {content: {application/json: {schema: {type: object, properties: {thread_id: {type: string}, approved: {type: boolean}}}}}}
+      responses: {"200": {description: Answer}}
+  /scenario/{name}:
+    post:
+      summary: Deterministic scenario path (no model)
+      parameters: [{name: name, in: path, required: true, schema: {type: string}}]
+      responses: {"200": {description: Result and per-hop record}}
+  /whoami: {get: {summary: Identity status, responses: {"200": {description: OK}}}}
+  /health: {get: {summary: Liveness, responses: {"200": {description: OK}}}}
