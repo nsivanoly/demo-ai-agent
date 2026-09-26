@@ -44,6 +44,10 @@ import llm
 AGENT = os.getenv("AGENT_NAME", "demo3-concierge")
 PREFIX = os.getenv("SCOPE_PREFIX", "svc")
 PAYMENTS_URL = os.getenv("PAYMENTS_AGENT_URL", "").rstrip("/")
+# Agents are sandboxed: a pod may not call another agent directly. The call goes through
+# the agent gateway (which validates the delegated token), addressed in-cluster, with the
+# public host name the gateway routes on.
+AGENT_GATEWAY_HOST = os.getenv("AGENT_GATEWAY_HOST", "")
 CONTROL = os.getenv("CONTROL_SERVICE_URL", "").rstrip("/")
 SC = lambda a: f"{PREFIX}:{a}"   # noqa: E731
 
@@ -105,11 +109,14 @@ def _to_payments(c: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
     c["trail"].hop("token exchange (OBO) for the payments agent", "ALLOW",
                    f"delegation for the payments agent: {d['granted']}", decided_by="ThunderID", token=d["view"])
     try:
-        r = httpx.post(f"{PAYMENTS_URL}/settle", timeout=90, headers={"Authorization": f"Bearer {d['token']}",
-                       "User-Agent": identity.UA}, json={**body, "txn": c["trail"].txn, "username": c["username"]})
+        hdrs = {"Authorization": f"Bearer {d['token']}", "User-Agent": identity.UA}
+        if AGENT_GATEWAY_HOST:
+            hdrs["Host"] = AGENT_GATEWAY_HOST
+        r = httpx.post(f"{PAYMENTS_URL}/settle", timeout=90, headers=hdrs,
+                       json={**body, "txn": c["trail"].txn, "username": c["username"]})
         out = r.json()
     except (httpx.HTTPError, ValueError) as e:
-        c["trail"].hop("call payments agent", "DENY", f"payments agent unreachable: {e}")
+        c["trail"].hop("call payments agent", "DENY", f"payments agent unreachable: {e}", decided_by="network")
         return {"status": "failed", "reason": str(e)}
     c["trail"].hops.extend(out.get("hops") or [])
     return {k: v for k, v in out.items() if k != "hops"}
