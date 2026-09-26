@@ -1,0 +1,10 @@
+openapi: 3.0.3
+info: {title: Payments Agent, version: "3.0"}
+paths:
+  /settle:
+    post:
+      summary: Pay a fee or request a refund under a token delegated by the concierge agent
+      requestBody: {content: {application/json: {schema: {type: object, properties: {action: {type: string, enum: [pay, refund]}, application_id: {type: string}, amount: {type: number}, approval_ref: {type: string}, txn: {type: string}}}}}}
+      responses: {"200": {description: Outcome and per-hop record}}
+  /whoami: {get: {summary: Identity status, responses: {"200": {description: OK}}}}
+  /health: {get: {summary: Liveness, responses: {"200": {description: OK}}}}
