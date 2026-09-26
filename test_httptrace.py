@@ -28,3 +28,8 @@ print("raw JWT anywhere in the record:", JWT in blob, "| client secret anywhere:
 print("exchange form as recorded:", calls[0]["request_body"])
 print("auth header as recorded:", [h for h in calls[1]["request_headers"] if h[0].lower() == "authorization"])
 print("token response as recorded:", calls[0]["response_body"])
+
+import httpx2
+c2 = httpx2.Client(transport=httpx2.MockTransport(lambda r: httpx2.Response(200, json={"choices": [{"message": {"content": "ok"}}]})))
+c2.post("http://llm/v1/chat/completions", headers={"api-key": "llm-key-999"}, json={"messages": [{"role": "user", "content": "hi"}]})
+print("httpx2 (OpenAI SDK) call recorded:", calls[-1]["url"], "| api key masked:", "llm-key-999" not in json.dumps(calls))
