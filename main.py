@@ -93,7 +93,7 @@ def delegate(s: S) -> S:
 
 
 def profile(s: S) -> S:
-    user = identity.claims(s["incoming"]).get("username") or s["req"].get("username") or ""
+    user = identity.citizen(s["incoming"]) or s["req"].get("username") or ""
     r = gateway.call_tool(s["delegated"]["token"], "get_profile", {"username": user}, _ctx(s))
     s["trail"].hop("get_profile", "ALLOW" if r["allowed"] else "DENY", r["reason"][:160], decided_by=r["decided_by"],
                    result={k: v for k, v in (r.get("result") or {}).items() if k in ("payment_ref", "name")} if r["allowed"] else None)
