@@ -108,9 +108,18 @@ def own_token(scope: Optional[List[str]] = None, resource: str = "") -> str:
     return tok
 
 
+def live_grant() -> List[str]:
+    """This agent's grant as the IdP sees it RIGHT NOW: a fresh client_credentials
+    token asking for everything the agent was set up with, which ThunderID filters
+    to the agent's current AMP roles. Not cached, so removing a role restricts the
+    agent on its very next delegation."""
+    form = {"grant_type": "client_credentials", "resource": MCP_RESOURCE, "scope": " ".join(OWN_SCOPES)}
+    return scopes_of(_post(form)["access_token"])
+
+
 def cap(requested: List[str]) -> Tuple[List[str], List[str]]:
-    """Split requested scopes into (within this agent's grant, beyond it)."""
-    own = set(OWN_SCOPES)
+    """Split requested scopes into (within this agent's live grant, beyond it)."""
+    own = set(live_grant())
     return [s for s in requested if s in own], [s for s in requested if s not in own]
 
 
