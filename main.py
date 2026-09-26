@@ -132,8 +132,7 @@ def _child(c: Dict[str, Any], application_id: str, scopes: List[str], try_tools:
                    decided_by="ThunderID", child=child["name"], owner=child.get("owner"))
     results: Dict[str, Any] = {"child": child["name"]}
     try:
-        from_endpoint = child["token_endpoint"]
-        tok_r = httpx.post(from_endpoint, auth=(child["client_id"], child["client_secret"]), timeout=15,
+        tok_r = httpx.post(identity.TOKEN_ENDPOINT, auth=(child["client_id"], child["client_secret"]), timeout=15,
                            data={"grant_type": "client_credentials", "scope": " ".join(scopes + [SC("fees-pay")]),
                                  "resource": identity.MCP_RESOURCE}, headers={"User-Agent": identity.UA})
         ctok = tok_r.json().get("access_token", "")
@@ -151,7 +150,7 @@ def _child(c: Dict[str, Any], application_id: str, scopes: List[str], try_tools:
             httpx.delete(f"{CONTROL}/children/{child['id']}", headers=auth, timeout=15)
         except httpx.HTTPError:
             pass
-        after = httpx.post(child["token_endpoint"], auth=(child["client_id"], child["client_secret"]), timeout=15,
+        after = httpx.post(identity.TOKEN_ENDPOINT, auth=(child["client_id"], child["client_secret"]), timeout=15,
                            data={"grant_type": "client_credentials", "resource": identity.MCP_RESOURCE},
                            headers={"User-Agent": identity.UA})
         c["trail"].hop("terminate child", "ALLOW" if after.status_code != 200 else "DENY",
