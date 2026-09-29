@@ -29,6 +29,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
+from bindings import injected
+
 UA = "Trusted-Agents-Demo/1.0"
 CLIENT_ID = os.getenv("AMP_AGENTID_CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("AMP_AGENTID_CLIENT_SECRET", "")
@@ -36,7 +38,9 @@ TOKEN_ENDPOINT = os.getenv("AMP_AGENTID_TOKEN_ENDPOINT", "")
 # The agent's own grant: written by setup after roles are assigned, because
 # AMP_AGENTID_SCOPES is computed at creation, before any role exists.
 OWN_SCOPES = (os.getenv("AGENT_ROLE_SCOPES") or os.getenv("AMP_AGENTID_SCOPES", "")).split()
-MCP_RESOURCE = os.getenv("MCP_RESOURCE", "")
+# The MCP gateway URL Agent Manager injects for the attached MCP server: every delegation
+# token is issued for it (the one resource a ThunderID token can carry).
+MCP_RESOURCE = injected("MCP_URL", fallback="MCP_RESOURCE")
 # Verified subject (sub) -> citizen record, written by setup. A record is looked up by
 # the token's subject, which the IdP always issues, never by the username claim alone:
 # that is an optional attribute the user can decline on the consent screen.

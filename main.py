@@ -25,6 +25,7 @@ from pydantic import BaseModel
 
 import httptrace  # noqa: F401  (wraps httpx first, so every outbound call is recorded)
 import audit
+import bindings
 import gateway
 import identity
 import llm
@@ -196,7 +197,8 @@ def settle(req: Settle, authorization: Optional[str] = Header(default=None),
 def whoami() -> Dict[str, Any]:
     info: Dict[str, Any] = {"agent": AGENT, "agentid_configured": identity.configured(), "own_scopes": identity.OWN_SCOPES,
                             "trusted_delegator": TRUSTED_DELEGATOR, "llm_configured": llm.configured(),
-                            "mcp_gateway": gateway.MCP_GATEWAY_URL}
+                            "mcp_gateway": gateway.MCP_GATEWAY_URL,
+                            "bindings": bindings.report()}
     try:
         info["token"] = identity.view(identity.own_token())
     except identity.IdentityError as e:

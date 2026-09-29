@@ -1,8 +1,8 @@
 """
 The model, reached only through this agent's Agent Manager LLM proxy.
 
-Binding an LLM provider to the agent (a model config) makes Agent Manager inject
-<CONFIG>_URL and <CONFIG>_API_KEY. The provider carries the guardrails (a regex
+Attaching an LLM provider to the agent makes Agent Manager inject the proxy's URL
+and API key (LLM_URL, LLM_API_KEY; see bindings.py). The provider carries the guardrails (a regex
 guardrail against prompt injection, PII redaction for card and ID numbers), so
 every call this agent makes passes through them. A blocked prompt comes back as
 HTTP 422 GUARDRAIL_INTERVENED.
@@ -13,19 +13,14 @@ from __future__ import annotations
 import os
 from typing import Optional, Tuple
 
+from bindings import injected
 from gateway import internal
 
 MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 
 def _injected() -> Tuple[str, str]:
-    url = key = ""
-    for k, v in os.environ.items():
-        if k.endswith("_LLM_URL") and not url:
-            url = v
-        elif k.endswith("_LLM_API_KEY") and not key:
-            key = v
-    return internal(url), key
+    return internal(injected("LLM_URL")), injected("LLM_API_KEY")
 
 
 def chat_model(temperature: float = 0.0):
