@@ -32,6 +32,10 @@ import llm
 
 AGENT = os.getenv("AGENT_NAME", "demo3-payments")
 TRUSTED_DELEGATOR = os.getenv("CONCIERGE_AGENT_ID", "")      # Agent A's AgentID subject
+# ...and its client. ThunderID does not check that an exchange's actor_token belongs to the
+# client exchanging it, so a stolen Agent A token lets ANY exchange-enabled client mint a
+# token with act = Agent A. The issued token's client_id still names the real exchanger.
+TRUSTED_CLIENT = os.getenv("CONCIERGE_CLIENT_ID", "")
 SCOPE = lambda a: f"{os.getenv('SCOPE_PREFIX', 'svc')}:{a}"   # noqa: E731
 CONTROL = os.getenv("CONTROL_SERVICE_URL", "").rstrip("/")
 
@@ -48,9 +52,15 @@ class Settle(BaseModel):
     txn: str = ""
 
 
+# Credentials never go into the graph state: Agent Manager's tracing records the state as
+# each run's input and output, so a token there is readable by anyone who can read traces.
+# The state carries an opaque reference; the tokens stay in this per-request table.
+_CREDS: Dict[str, Dict[str, str]] = {}
+
+
 class S(TypedDict, total=False):
     req: Dict[str, Any]
-    incoming: str
+    cred: str                        # reference into _CREDS, never a token
     trail: Any
     delegated: Dict[str, Any]
     profile: Dict[str, Any]
@@ -59,44 +69,58 @@ class S(TypedDict, total=False):
     stop: bool
 
 
+def _incoming(s: S) -> str:
+    return _CREDS[s["cred"]]["incoming"]
+
+
+def _delegated(s: S) -> str:
+    return _CREDS[s["cred"]]["delegated"]
+
+
 def _ctx(s: S) -> Dict[str, Any]:
-    c = identity.claims(s["incoming"])
+    c = identity.claims(_incoming(s))
     return {"txn": s["trail"].txn, "actor": AGENT, "user": c.get("username") or s["req"].get("username"),
             "chain": ["user", "demo3-concierge", AGENT]}
 
 
 def verify(s: S) -> S:
-    c = identity.claims(s["incoming"])
+    c = identity.claims(_incoming(s))
     actor = (c.get("act") or {}).get("sub")
     if not actor:
         s["trail"].hop("verify delegation", "DENY", "token carries no act claim: not a delegation",
-                       decided_by=AGENT, token=identity.view(s["incoming"]))
+                       decided_by=AGENT, token=identity.view(_incoming(s)))
         return {"stop": True, "outcome": {"status": "denied", "reason": "not a delegated token"}}
+    if TRUSTED_CLIENT and c.get("client_id") != TRUSTED_CLIENT:
+        s["trail"].hop("verify delegation", "DENY",
+                       f"act claims the concierge, but the token was issued to client {c.get('client_id')}: "
+                       "a stolen actor token used by another client", decided_by=AGENT, token=identity.view(_incoming(s)))
+        return {"stop": True, "outcome": {"status": "denied", "reason": "delegation not issued to the concierge agent"}}
     if TRUSTED_DELEGATOR and actor != TRUSTED_DELEGATOR:
         s["trail"].hop("verify delegation", "DENY", f"act={actor} is not the concierge agent",
-                       decided_by=AGENT, token=identity.view(s["incoming"]))
+                       decided_by=AGENT, token=identity.view(_incoming(s)))
         return {"stop": True, "outcome": {"status": "denied", "reason": "delegation not from the concierge agent"}}
     s["trail"].hop("verify delegation", "ALLOW", f"on behalf of {c.get('username') or c.get('sub')}, act = concierge",
-                   decided_by=AGENT, token=identity.view(s["incoming"]))
+                   decided_by=AGENT, token=identity.view(_incoming(s)))
     return {}
 
 
 def delegate(s: S) -> S:
     need = [SCOPE("fees-pay") if s["req"]["action"] == "pay" else SCOPE("refund-request"), SCOPE("profile-read")]
     try:
-        d = identity.delegate(s["incoming"], need)
+        d = identity.delegate(_incoming(s), need)
     except identity.IdentityError as e:
         s["trail"].hop("token exchange (OBO)", "DENY", str(e), decided_by="ThunderID")
         return {"stop": True, "outcome": {"status": "denied", "reason": str(e)}}
     s["trail"].hop("token exchange (OBO)", "ALLOW" if d["granted"] else "DENY",
                    f"asked {d['requested']}, capped out {d['capped_out'] or 'nothing'}, granted {d['granted']}",
                    decided_by="ThunderID", token=d["view"], actor_token=d["actor_view"])
-    return {"delegated": d}
+    _CREDS[s["cred"]]["delegated"] = d["token"]
+    return {"delegated": {k: v for k, v in d.items() if k != "token"}}
 
 
 def profile(s: S) -> S:
-    user = identity.citizen(s["incoming"]) or s["req"].get("username") or ""
-    r = gateway.call_tool(s["delegated"]["token"], "get_profile", {"username": user}, _ctx(s))
+    user = identity.citizen(_incoming(s)) or s["req"].get("username") or ""
+    r = gateway.call_tool(_delegated(s), "get_profile", {"username": user}, _ctx(s))
     s["trail"].hop("get_profile", "ALLOW" if r["allowed"] else "DENY", r["reason"][:160], decided_by=r["decided_by"],
                    result={k: v for k, v in (r.get("result") or {}).items() if k in ("payment_ref", "name")} if r["allowed"] else None)
     if not r["allowed"]:
@@ -105,7 +129,7 @@ def profile(s: S) -> S:
 
 
 def execute(s: S) -> S:
-    q, tok = s["req"], s["delegated"]["token"]
+    q, tok = s["req"], _delegated(s)
     if q["action"] == "pay":
         ref = s["profile"].get("payment_ref", "")
         r = gateway.call_tool(tok, "pay_fee", {"application_id": q["application_id"], "payment_ref": ref,
@@ -116,7 +140,8 @@ def execute(s: S) -> S:
         return {"outcome": {"status": "paid" if r["allowed"] else "denied", "receipt": r.get("result"),
                             "reason": r["reason"], "card_number_seen_by_agent": None}}
     r = gateway.call_tool(tok, "request_refund", {"application_id": q["application_id"], "amount": q["amount"],
-                                                  "reason": q.get("reason", ""), "approval_ref": q.get("approval_ref", "")}, _ctx(s))
+                                                  "reason": q.get("reason", ""),
+                                                  "approval_ref": _CREDS[s["cred"]].get("approval_ref", "")}, _ctx(s))
     res = r.get("result") or {}
     if r["allowed"] and res.get("status") == "HITL_REQUIRED":
         approval = _open_approval(s, res)
@@ -138,7 +163,7 @@ def _open_approval(s: S, res: Dict[str, Any]) -> Dict[str, Any]:
                        "Authorization": f"Bearer {identity.own_token()}"},
                        json={"txn": s["trail"].txn, "application_id": s["req"]["application_id"],
                              "amount": s["req"]["amount"], "request_id": res.get("request_id"),
-                             "requested_by": identity.claims(s["incoming"]).get("username"), "agent": AGENT})
+                             "requested_by": identity.claims(_incoming(s)).get("username"), "agent": AGENT})
         return r.json()
     except (httpx.HTTPError, ValueError):
         return {}
@@ -187,8 +212,15 @@ def settle(req: Settle, authorization: Optional[str] = Header(default=None),
     if not token:
         trail.hop("verify delegation", "DENY", "no token presented", decided_by=AGENT)
         return {"status": "denied", "reason": "no token", "hops": trail.hops, "http": calls}
-    out = GRAPH.invoke({"req": req.model_dump(), "incoming": token, "trail": trail},
-                       config={"run_name": f"payments.{req.action}", "metadata": {"txn": trail.txn}})
+    ref = uuid.uuid4().hex
+    _CREDS[ref] = {"incoming": token, "approval_ref": req.approval_ref}   # a signed approval is a credential too
+    q = req.model_dump()
+    q["approval_ref"] = "‹held›" if req.approval_ref else ""
+    try:
+        out = GRAPH.invoke({"req": q, "cred": ref, "trail": trail},
+                           config={"run_name": f"payments.{req.action}", "metadata": {"txn": trail.txn}})
+    finally:
+        _CREDS.pop(ref, None)
     o = out.get("outcome") or {}
     return {**o, "summary": out.get("summary"), "agent": AGENT, "txn": trail.txn, "hops": trail.hops, "http": calls}
 
