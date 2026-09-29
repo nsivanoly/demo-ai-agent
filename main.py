@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import uuid
 from typing import Annotated, Any, Dict, List, Optional, TypedDict
 
@@ -128,11 +129,12 @@ def _to_payments(c: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in out.items() if k not in ("hops", "http")}
 
 
-def _child(c: Dict[str, Any], application_id: str, scopes: List[str], try_tools: List[str]) -> Dict[str, Any]:
-    """Spawn a child agent with its own short-lived identity, use it, terminate it, prove it is unusable."""
+def _child(c: Dict[str, Any], application_id: str, scopes: List[str], try_tools: List[str], hold_seconds: int = 0) -> Dict[str, Any]:
+    """Spawn a child agent with its own short-lived identity, use it, terminate it, prove it is unusable.
+    hold_seconds keeps the child alive before termination, so it can be seen in the AMP Console."""
     auth = {"Authorization": f"Bearer {identity.own_token()}", "User-Agent": identity.UA}
     try:
-        r = httpx.post(f"{CONTROL}/children", timeout=30, headers=auth,
+        r = httpx.post(f"{CONTROL}/children", timeout=90, headers=auth,
                        json={"purpose": "document check", "scopes": scopes, "txn": c["trail"].txn})
         child = r.json()
     except (httpx.HTTPError, ValueError) as e:
@@ -142,7 +144,7 @@ def _child(c: Dict[str, Any], application_id: str, scopes: List[str], try_tools:
         c["trail"].hop("spawn child", "DENY", child.get("reason", r.text[:200]), decided_by="control service (broker)")
         return {"status": "refused", "reason": child.get("reason")}
     c["trail"].hop("spawn child", "ALLOW", f"child {child['name']} with {child['scopes']}, token life {child['token_seconds']}s",
-                   decided_by="ThunderID", child=child["name"], owner=child.get("owner"))
+                   decided_by="Agent Manager (via the broker)", child=child["name"], owner=child.get("owner"))
     results: Dict[str, Any] = {"child": child["name"]}
     try:
         tok_r = httpx.post(identity.TOKEN_ENDPOINT, auth=(child["client_id"], child["client_secret"]), timeout=15,
@@ -158,9 +160,14 @@ def _child(c: Dict[str, Any], application_id: str, scopes: List[str], try_tools:
             rr = gateway.call_tool(ctok, t, args, {**_mcp_ctx(c), "actor": child["name"]})
             c["trail"].hop(f"child: {t}", "ALLOW" if rr["allowed"] else "DENY", rr["reason"][:160], decided_by=rr["decided_by"])
             results[t] = rr["result"] if rr["allowed"] else {"refused": rr["reason"]}
+        if hold_seconds > 0:
+            hold = min(int(hold_seconds), 120)
+            c["trail"].hop("child: alive", "ALLOW", f"{child['name']} kept alive {hold}s: visible in Agent Manager (Agents, Agent identities → Roles)",
+                           decided_by=AGENT)
+            time.sleep(hold)
     finally:
         try:
-            httpx.delete(f"{CONTROL}/children/{child['id']}", headers=auth, timeout=15)
+            httpx.delete(f"{CONTROL}/children/{child['id']}", headers=auth, timeout=30)
         except httpx.HTTPError:
             pass
         after = httpx.post(identity.TOKEN_ENDPOINT, auth=(child["client_id"], child["client_secret"]), timeout=15,
@@ -413,6 +420,7 @@ class Scenario(BaseModel):
     scopes: List[str] = []
     try_tools: List[str] = ["get_application_status", "pay_fee"]
     txn: str = ""
+    hold_seconds: int = 0
 
 
 def _scenario_ctx(token: str, txn: str) -> Dict[str, Any]:
@@ -435,7 +443,7 @@ def scenario(name: str, req: Scenario, authorization: Optional[str] = Header(def
         out = run_tool("request_refund", {"application_id": req.application_id, "amount": req.amount,
                                           "approval_ref": req.approval_ref}, c)
     elif name == "child":
-        out = _child(c, req.application_id, req.scopes or [SC("application-read")], req.try_tools)
+        out = _child(c, req.application_id, req.scopes or [SC("application-read")], req.try_tools, req.hold_seconds)
     elif name == "own-token-direct":
         # What this agent could do with ONLY its own AgentID token (no user), for the lifecycle scenario.
         tok = identity.own_token()
