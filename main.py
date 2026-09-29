@@ -38,6 +38,7 @@ from pydantic import BaseModel
 
 import httptrace  # noqa: F401  (wraps httpx first, so every outbound call is recorded)
 import audit
+import bindings
 import gateway
 import identity
 import llm
@@ -452,7 +453,8 @@ def scenario(name: str, req: Scenario, authorization: Optional[str] = Header(def
 def whoami() -> Dict[str, Any]:
     info: Dict[str, Any] = {"agent": AGENT, "agentid_configured": identity.configured(), "own_scopes": identity.OWN_SCOPES,
                             "llm_configured": llm.configured(), "payments_agent": PAYMENTS_URL,
-                            "mcp_gateway": gateway.MCP_GATEWAY_URL, "control_service": CONTROL}
+                            "mcp_gateway": gateway.MCP_GATEWAY_URL, "control_service": CONTROL,
+                            "bindings": bindings.report()}
     try:
         info["token"] = identity.view(identity.own_token())
     except identity.IdentityError as e:
