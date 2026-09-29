@@ -190,7 +190,8 @@ def _open_approval(s: S, res: Dict[str, Any]) -> Dict[str, Any]:
                        "Authorization": f"Bearer {identity.own_token()}"},
                        json={"txn": s["trail"].txn, "application_id": s["req"]["application_id"],
                              "amount": s["req"]["amount"], "request_id": res.get("request_id"),
-                             "requested_by": identity.claims(_incoming(s)).get("username"), "agent": AGENT})
+                             "requested_by": identity.claims(_incoming(s)).get("username") or s["req"].get("username") or "",
+                             "agent": AGENT})
         return r.json()
     except (httpx.HTTPError, ValueError):
         return {}
