@@ -38,6 +38,9 @@ TRUSTED_DELEGATOR = os.getenv("CONCIERGE_AGENT_ID", "")      # Agent A's AgentID
 TRUSTED_CLIENT = os.getenv("CONCIERGE_CLIENT_ID", "")
 SCOPE = lambda a: f"{os.getenv('SCOPE_PREFIX', 'svc')}:{a}"   # noqa: E731
 CONTROL = os.getenv("CONTROL_SERVICE_URL", "").rstrip("/")
+# The Ledger API (system of record) behind the platform API gateway, which authorizes
+# every settlement: scope fees-pay and client_id = this agent, i.e. its delegated token.
+LEDGER = os.getenv("LEDGER_API_URL", "").rstrip("/")
 
 app = FastAPI(title="Payments Agent", version="3.0")
 
@@ -137,8 +140,9 @@ def execute(s: S) -> S:
         s["trail"].hop("pay_fee", "ALLOW" if r["allowed"] else "DENY",
                        f"paid with vault reference {ref}" if r["allowed"] else r["reason"][:200],
                        decided_by=r["decided_by"], result=r.get("result"))
+        settlement = _settle(s, r.get("result") or {}, ref) if r["allowed"] else None
         return {"outcome": {"status": "paid" if r["allowed"] else "denied", "receipt": r.get("result"),
-                            "reason": r["reason"], "card_number_seen_by_agent": None}}
+                            "settlement": settlement, "reason": r["reason"], "card_number_seen_by_agent": None}}
     r = gateway.call_tool(tok, "request_refund", {"application_id": q["application_id"], "amount": q["amount"],
                                                   "reason": q.get("reason", ""),
                                                   "approval_ref": _CREDS[s["cred"]].get("approval_ref", "")}, _ctx(s))
@@ -153,6 +157,29 @@ def execute(s: S) -> S:
                    decided_by=r["decided_by"], result=res or None)
     return {"outcome": {"status": "refunded" if r["allowed"] else "blocked" if r["decided_by"] == "server" else "denied",
                         "result": res or None, "reason": r["reason"], "detail": r.get("detail")}}
+
+
+def _settle(s: S, receipt: Dict[str, Any], ref: str) -> Optional[Dict[str, Any]]:
+    """Record the captured payment in the Ledger API, with the user's delegated token."""
+    if not LEDGER:
+        return None
+    body = {"application_id": s["req"]["application_id"], "receipt_id": receipt.get("receipt_id", ""),
+            "amount": receipt.get("amount", s["req"]["amount"]), "currency": receipt.get("currency", "AED"),
+            "instrument": receipt.get("instrument", ""), "payment_ref": ref}
+    try:
+        r = httpx.post(f"{LEDGER}/settlements", json=body, timeout=20, headers={
+            "Authorization": f"Bearer {_delegated(s)}", "User-Agent": identity.UA, "X-Transaction-Id": s["trail"].txn})
+    except httpx.HTTPError as e:
+        s["trail"].hop("ledger API (settlement)", "DENY", f"unreachable: {e}", decided_by="-")
+        return None
+    ok = r.status_code == 200
+    by = "API gateway" if r.status_code in (401, 403) else "ledger API"
+    data = r.json() if ok else None
+    s["trail"].hop("ledger API (settlement)", "ALLOW" if ok else "DENY",
+                   f"recorded {data.get('settlement_id')} on behalf of the user, acting client = this agent" if ok
+                   else f"{r.status_code} {r.text[:160]}", decided_by=by,
+                   result={k: data.get(k) for k in ("settlement_id", "receipt_id", "amount", "instrument")} if ok else None)
+    return data
 
 
 def _open_approval(s: S, res: Dict[str, Any]) -> Dict[str, Any]:
@@ -222,7 +249,8 @@ def settle(req: Settle, authorization: Optional[str] = Header(default=None),
     finally:
         _CREDS.pop(ref, None)
     o = out.get("outcome") or {}
-    return {**o, "summary": out.get("summary"), "agent": AGENT, "txn": trail.txn, "hops": trail.hops, "http": calls}
+    return {**o, "summary": out.get("summary"), "agent": AGENT, "txn": trail.txn, "hops": trail.hops, "http": calls,
+            "trace_ids": trail.trace_ids}
 
 
 @app.get("/whoami")
