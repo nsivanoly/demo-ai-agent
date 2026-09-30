@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -33,6 +34,37 @@ def trace_id() -> str:
         return format(ctx.trace_id, "032x") if ctx.is_valid else ""
     except Exception:                       # no SDK in this runtime: nothing to link
         return ""
+
+def trace_headers() -> Dict[str, str]:
+    """W3C trace context (traceparent) for an outbound call to another agent, so both
+    agents' spans land in one Agent Manager trace."""
+    try:
+        from opentelemetry.propagate import inject
+        h: Dict[str, str] = {}
+        inject(h)
+        return h
+    except Exception:                       # no SDK in this runtime: nothing to propagate
+        return {}
+
+
+@contextmanager
+def continue_trace(headers: Dict[str, str]):
+    """Run the block inside the caller's trace (its traceparent), when one was sent."""
+    token = None
+    try:
+        from opentelemetry import context
+        from opentelemetry.propagate import extract
+        if any(k.lower() == "traceparent" for k in headers):
+            token = context.attach(extract({k.lower(): v for k, v in headers.items()}))
+    except Exception:
+        token = None
+    try:
+        yield
+    finally:
+        if token is not None:
+            from opentelemetry import context
+            context.detach(token)
+
 
 AGENT = os.getenv("AGENT_NAME", "agent")
 

@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, TypedDict
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Header
+from fastapi import FastAPI, Header, Request
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel
 
@@ -229,7 +229,7 @@ GRAPH = g.compile()
 
 
 @app.post("/settle")
-def settle(req: Settle, authorization: Optional[str] = Header(default=None),
+def settle(req: Settle, request: Request, authorization: Optional[str] = Header(default=None),
            x_forwarded_authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
     # The agent gateway validates the caller's token and forwards it as
     # X-Forwarded-Authorization (its jwt-auth default).
@@ -245,8 +245,9 @@ def settle(req: Settle, authorization: Optional[str] = Header(default=None),
     q = req.model_dump()
     q["approval_ref"] = "‹held›" if req.approval_ref else ""
     try:
-        out = GRAPH.invoke({"req": q, "cred": ref, "trail": trail},
-                           config={"run_name": f"payments.{req.action}", "metadata": {"txn": trail.txn}})
+        with audit.continue_trace(dict(request.headers)):       # the concierge's traceparent: one trace, both agents
+            out = GRAPH.invoke({"req": q, "cred": ref, "trail": trail},
+                               config={"run_name": f"payments.{req.action}", "metadata": {"txn": trail.txn}})
     finally:
         _CREDS.pop(ref, None)
     o = out.get("outcome") or {}
