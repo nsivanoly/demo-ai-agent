@@ -113,7 +113,7 @@ def _to_payments(c: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
                    f"delegation for the payments agent: {d['granted']}", decided_by="ThunderID", token=d["view"],
                    actor_token=d["actor_view"])
     try:
-        hdrs = {"Authorization": f"Bearer {d['token']}", "User-Agent": identity.UA}
+        hdrs = {"Authorization": f"Bearer {d['token']}", "User-Agent": identity.UA, **audit.trace_headers()}   # one trace across both agents
         if AGENT_GATEWAY_HOST:
             hdrs["Host"] = AGENT_GATEWAY_HOST
         r = httpx.post(f"{PAYMENTS_URL}/settle", timeout=90, headers=hdrs,
