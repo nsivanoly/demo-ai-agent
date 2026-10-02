@@ -78,6 +78,8 @@ _VAULT: Dict[str, Dict[str, str]] = {
     "tok_card_4417": {"type": "card", "pan": "5412753456784417", "holder": "Blake Rivera"},
     "tok_nid_0721": {"type": "national_id", "value": "784198712345672", "holder": "Alex Morgan"},
     "tok_nid_3350": {"type": "national_id", "value": "784199054321350", "holder": "Blake Rivera"},
+    "tok_card_1111": {"type": "card", "pan": "4111111111111111", "holder": "Sivanoly"},      # a standard test card
+    "tok_nid_1003": {"type": "national_id", "value": "784199012345671", "holder": "Sivanoly"},
 }
 
 

@@ -53,6 +53,9 @@ PROFILES = {
              "national_id_ref": "tok_nid_0721", "payment_ref": "tok_card_9931"},
     "blake": {"profile_id": "BUS-2001", "name": "Blake Rivera", "type": "business owner",
               "national_id_ref": "tok_nid_3350", "payment_ref": "tok_card_4417"},
+    # the presenter's own UAE PASS account (the demo maps that sign-in to this record)
+    "sivanoly": {"profile_id": "RES-1003", "name": "Sivanoly", "type": "resident",
+                 "national_id_ref": "tok_nid_1003", "payment_ref": "tok_card_1111"},
 }
 APPLICATIONS = {
     "APP-5001": {"application_id": "APP-5001", "owner": "alex", "service": "Trade licence renewal",
@@ -61,6 +64,8 @@ APPLICATIONS = {
                  "status": "approved", "fee_due": 0.00, "paid": 1200.00, "overpaid": 900.00},
     "APP-5003": {"application_id": "APP-5003", "owner": "blake", "service": "Signage permit",
                  "status": "paid", "fee_due": 0.00, "paid": 180.00, "overpaid": 80.00},
+    "APP-5004": {"application_id": "APP-5004", "owner": "sivanoly", "service": "Residency permit renewal",
+                 "status": "awaiting payment", "fee_due": 250.00},
 }
 
 
