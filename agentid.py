@@ -98,6 +98,34 @@ def get_token(scopes: Optional[str] = None, resource: str = "") -> str:
     return token
 
 
+TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
+ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
+
+
+def exchange(subject_token: str, scope: str = "", resource: str = "") -> str:
+    """RFC 8693 token exchange at the environment identity provider: "this agent, acting for
+    the subject". The actor token is this agent's own AgentID token, so the result carries
+    sub = the user, act = this agent (nested for a chain), client_id = this agent's client.
+
+    The identity provider grants at most what the subject holds: asking for a scope the user
+    does not hold returns a token without it, not an error. Never cached: each delegation is
+    its own grant."""
+    if not configured():
+        raise AgentIDError("AgentID is not configured (AMP_AGENTID_* are injected by Agent Manager)")
+    actor = get_token(resource=resource)
+    data = {"grant_type": TOKEN_EXCHANGE, "subject_token": subject_token,
+            "subject_token_type": ACCESS_TOKEN_TYPE, "actor_token": actor,
+            "actor_token_type": ACCESS_TOKEN_TYPE}
+    if scope:
+        data["scope"] = scope
+    if resource:
+        data["resource"] = resource
+    resp = httpx.post(TOKEN_ENDPOINT, data=data, auth=(CLIENT_ID, CLIENT_SECRET), timeout=20)
+    if resp.status_code >= 400:
+        raise AgentIDError(f"token exchange refused ({resp.status_code}): {resp.text[:200]}")
+    return resp.json()["access_token"]
+
+
 def granted_scopes() -> str:
     return DEFAULT_SCOPES
 

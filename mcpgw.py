@@ -92,7 +92,8 @@ def gateway_url() -> str:
 def _rpc(url: str, token: str, method: str, params: Any,
          trace_id: str = "") -> Dict[str, Any]:
     headers = {"Content-Type": "application/json",
-               "Accept": "application/json, text/event-stream"}
+               "Accept": "application/json, text/event-stream",
+               "User-Agent": "AMP-Demo2/1.0"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     if trace_id:
