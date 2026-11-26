@@ -47,6 +47,11 @@ AGENT_ID = os.getenv("AGENT_NAME", "demo2-concierge-agent")
 RUNTIME = os.getenv("AGENT_RUNTIME", "runtime-a")
 PAYMENTS_AGENT = os.getenv("PAYMENTS_AGENT_NAME", "demo2-payments-agent")
 PAYMENTS_URL = os.getenv("PAYMENTS_AGENT_URL", "")
+# The payments agent's A2A JSON-RPC endpoint on Agent Manager's gateway (in-cluster address;
+# AGENT_GATEWAY_HOST is the Host the gateway routes on). Written by the demo setup.
+PAYMENTS_A2A_URL = os.getenv("PAYMENTS_A2A_URL",
+                             "http://gateway-default.openchoreo-data-plane:19080/demo2-payments-agent/rpc")
+AGENT_GATEWAY_HOST = os.getenv("AGENT_GATEWAY_HOST", "")
 # Several plausible in-cluster addresses, tried in order. The service name and
 # port are not discoverable from inside the agent, and the published endpoint
 # sits behind an API key this agent has no way to obtain -- so the honest thing
@@ -103,9 +108,12 @@ async def payments_base(client: httpx.AsyncClient) -> str:
                 return _payments_base
         except Exception:
             continue
-    _payments_base = (PAYMENTS_CANDIDATES[0] if PAYMENTS_CANDIDATES
-                      else PAYMENTS_URL).rstrip("/")
-    return _payments_base
+    # Nothing answered. Return a best guess but do NOT cache it: the payments
+    # agent is restarted whenever its AgentID secret is rotated, and caching a
+    # base that was dead during that window would keep this agent reporting it
+    # unreachable long after it came back.
+    return (PAYMENTS_CANDIDATES[0] if PAYMENTS_CANDIDATES
+            else PAYMENTS_URL).rstrip("/")
 
 
 class TaskRequest(BaseModel):
@@ -120,6 +128,21 @@ class TaskRequest(BaseModel):
     request_scopes: Optional[List[str]] = None   # ask to delegate specific scopes
     skip_delegation: bool = False                # try the confidential tool itself
     obo_ttl: int = 120
+
+
+def settlement(resp: Any) -> Dict[str, Any]:
+    """The payments agent's settlement.json artifact from an A2A SendMessage result: the first
+    data part carrying its audit steps, wherever the task puts it."""
+    stack = [resp]
+    while stack:
+        x = stack.pop()
+        if isinstance(x, dict):
+            if "steps" in x and "status" in x:
+                return x
+            stack.extend(x.values())
+        elif isinstance(x, list):
+            stack.extend(x)
+    return {}
 
 
 def _bearer(value: Optional[str]) -> str:
@@ -259,64 +282,65 @@ async def task(req: TaskRequest,
             return {"trace_id": trace_id, "status": "ok", "agent": AGENT_ID,
                     "user": user, "steps": steps}
 
-        # ---- hop 4: on-behalf-of exchange --------------------------------
-        want = req.request_scopes or [CONFIDENTIAL_SCOPE]
-        want = [s for s in want if s]
+        # ---- hop 4: delegation, by token exchange at the environment IdP --
+        # RFC 8693: alice's token (subject) + this agent's own AgentID token (actor) ->
+        # a token saying "the concierge, acting for alice". The IdP grants at most what
+        # alice holds, so asking for more than she consented to just comes back without it.
+        want = [s for s in (req.request_scopes or [CONFIDENTIAL_SCOPE]) if s]
         chain = [user.get("username", "user"), AGENT_ID, PAYMENTS_AGENT]
-        async with tracing.hop("obo_exchange", trace_id=trace_id,
+        if not bearer:
+            hop(steps, "agent -> IdP token exchange", "AMP", "DENY",
+                "no user token to exchange: a delegation needs a user to act for")
+            return {"trace_id": trace_id, "status": "denied", "at": "exchange",
+                    "agent": AGENT_ID, "user": user, "steps": steps}
+        async with tracing.hop("token_exchange", trace_id=trace_id,
                                audience=PAYMENTS_AGENT, requested_scope=want):
-          try:
-            assertion = obo.issue(
-                actor=AGENT_ID, subject=user.get("username", "user"),
-                audience=PAYMENTS_AGENT, scope=want, delegation_chain=chain,
-                trace_id=trace_id, ttl_seconds=req.obo_ttl,
-                # Deliberately NOT actor_scopes=my_scopes: the concierge is
-                # supposed to be able to ask the payments agent for something
-                # it cannot do itself -- that is delegation, not escalation.
-                # Escalation is constrained on the sub-agent path instead,
-                # where the child must stay within the parent's own grant.
-                user_sub=user.get("sub", ""), runtime=RUNTIME)
-            hop(steps, "agent -> obo exchange", "DEMO", "ALLOW",
-                f"assertion minted for {PAYMENTS_AGENT}, {req.obo_ttl}s",
-                actor=AGENT_ID, token=obo.claims(assertion))
-            tracing.record_decision("ALLOW", "agent",
-                                    f"on-behalf-of assertion for {PAYMENTS_AGENT}",
-                                    delegation_chain=chain, ttl_seconds=req.obo_ttl,
-                                    credential_kind="DEMO")
-          except obo.OBOError as exc:
-            hop(steps, "agent -> obo exchange", "DEMO", "DENY", str(exc),
-                actor=AGENT_ID)
-            tracing.record_decision("DENY", "agent", str(exc))
-            return {"trace_id": trace_id, "status": "denied", "at": "obo",
-                    "agent": AGENT_ID, "user": user, "steps": steps}
+            try:
+                delegated = agentid.exchange(bearer, scope=" ".join(want),
+                                             resource=mcpgw.gateway_resource())
+            except agentid.AgentIDError as exc:
+                hop(steps, "agent -> IdP token exchange", "AMP", "DENY", str(exc), actor=AGENT_ID)
+                tracing.record_decision("DENY", "amp-idp", str(exc))
+                return {"trace_id": trace_id, "status": "denied", "at": "exchange",
+                        "agent": AGENT_ID, "user": user, "steps": steps}
+            got = (agentid.claims(delegated).get("scope") or "").split()
+            hop(steps, "agent -> IdP token exchange", "AMP", "ALLOW",
+                f"acting for {user.get('username')}: asked for {' '.join(want) or 'nothing'}, "
+                f"granted {' '.join(got) or 'nothing'}", actor=AGENT_ID, token=token_view(delegated))
+            tracing.record_decision("ALLOW", "amp-idp", "token exchange (RFC 8693)",
+                                    requested_scopes=want, granted_scopes=got, credential_kind="AMP")
 
-        # ---- hop 5: agent -> agent ---------------------------------------
-        base = await payments_base(client)
-        async with tracing.hop("call_payments_agent", trace_id=trace_id,
-                               peer=PAYMENTS_AGENT, endpoint=base):
-          try:
-            r = await client.post(
-                f"{base}/settle",
-                json={"amount": req.amount, "payment_ref": req.payment_ref,
-                      "trace_id": trace_id},
-                headers={"Authorization": f"Bearer {assertion}"})
-            body = r.json()
-          except Exception as exc:
-            hop(steps, "agent -> agent", "DEMO", "DENY",
-                f"payments agent unreachable at {base}: {exc}")
-            tracing.record_decision("DENY", "agent",
-                                    f"payments agent unreachable: {exc}")
-            return {"trace_id": trace_id, "status": "failed", "at": "agent-to-agent",
-                    "agent": AGENT_ID, "user": user, "steps": steps}
-
-          hop(steps, "agent -> agent", "DEMO",
-              "ALLOW" if r.status_code < 400 else "DENY",
-              f"POST {base}/settle -> {r.status_code}", actor=AGENT_ID,
-              peer=PAYMENTS_AGENT)
-          tracing.record_decision("ALLOW" if r.status_code < 400 else "DENY",
-                                  "payments-agent",
-                                  f"settle -> HTTP {r.status_code}",
-                                  http_status=r.status_code)
+        # ---- hop 5: agent -> agent, over A2A through the gateway -------------
+        # The payments agent is an A2A agent: Agent Manager's gateway publishes it at
+        # /<agent>/rpc, checks the delegated token (OAuth), and forwards it. Requests
+        # must carry A2A-Version or the gateway refuses them.
+        url = PAYMENTS_A2A_URL
+        hdrs = {"Authorization": f"Bearer {delegated}", "A2A-Version": "1.0",
+                "Content-Type": "application/json"}
+        if AGENT_GATEWAY_HOST:
+            hdrs["Host"] = AGENT_GATEWAY_HOST
+        rpc = {"jsonrpc": "2.0", "id": trace_id, "method": "SendMessage", "params": {"message": {
+            "messageId": uuid.uuid4().hex, "role": "ROLE_USER", "parts": [{"text": "settle the payment"}],
+            "metadata": {"skill": "settle-payment", "amount": req.amount,
+                         "payment_ref": req.payment_ref, "trace_id": trace_id}}}}
+        async with tracing.hop("a2a_send_message", trace_id=trace_id, peer=PAYMENTS_AGENT, endpoint=url):
+            try:
+                r = await client.post(url, json=rpc, headers=hdrs, timeout=120)
+                body = settlement(r.json()) if r.status_code < 400 else {}
+            except Exception as exc:
+                hop(steps, "agent -> agent (A2A)", "AMP", "DENY",
+                    f"payments agent unreachable at {url}: {exc}")
+                tracing.record_decision("DENY", "agent", f"payments agent unreachable: {exc}")
+                return {"trace_id": trace_id, "status": "failed", "at": "agent-to-agent",
+                        "agent": AGENT_ID, "user": user, "steps": steps}
+            hop(steps, "agent -> gateway -> agent (A2A)", "AMP",
+                "ALLOW" if r.status_code < 400 and body else "DENY",
+                f"SendMessage -> HTTP {r.status_code}" + ("" if r.status_code < 400 else
+                f" (decided by the gateway: {r.text[:120]})"), actor=AGENT_ID, peer=PAYMENTS_AGENT,
+                decided_by="gateway" if r.status_code in (401, 403) else "payments-agent")
+            tracing.record_decision("ALLOW" if r.status_code < 400 else "DENY",
+                                    "gateway" if r.status_code in (401, 403) else "payments-agent",
+                                    f"A2A SendMessage -> HTTP {r.status_code}", http_status=r.status_code)
         steps.extend(body.get("steps", []))
         for i, s in enumerate(steps, 1):
             s["seq"] = i
