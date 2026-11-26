@@ -77,8 +77,17 @@ def token_view(tok: str) -> Dict[str, Any]:
 
 
 def bearer(headers: Dict[str, str]) -> str:
-    v = next((val for key, val in headers.items() if key.lower() == "authorization"), "")
-    return v[7:].strip() if v.lower().startswith("bearer ") else ""
+    """The caller's token. Agent Manager's gateway validates it and, with "forward token" on,
+    sends it on as x-forwarded-authorization with the original Authorization header removed;
+    a direct call (a local run) still carries Authorization."""
+    h = {k.lower(): v for k, v in headers.items()}
+    for name in ("x-forwarded-authorization", "authorization"):
+        v = (h.get(name) or "").strip()
+        if v.lower().startswith("bearer "):
+            return v[7:].strip()
+        if v and name == "x-forwarded-authorization" and v.count(".") == 2:   # forwarded without the prefix
+            return v
+    return ""
 
 
 def check_delegation(tok: str) -> str:
